@@ -39,6 +39,20 @@ type Config struct {
 	// has already completed when these callbacks run.
 	OnError func(error)
 
+	// UserIDResolver, when set, is called to extract the acting user's ID from
+	// the request context. Use this to read whatever key your auth middleware
+	// already sets — then db.WithContext(ctx) is the only call you need:
+	//
+	//   db.Use(auditablegorm.New(auditablegorm.Config{
+	//       UserIDResolver: func(ctx context.Context) (string, bool) {
+	//           id, ok := ctx.Value(myMiddleware.UserKey).(string)
+	//           return id, ok && id != ""
+	//       },
+	//   }))
+	//
+	// When nil the plugin falls back to the value stored by WithUserID.
+	UserIDResolver func(ctx context.Context) (string, bool)
+
 	// Store is the persistence backend for audit records.
 	// When nil the plugin creates a GormStore that writes to the SQL database.
 	// Inject a custom implementation to route audit records elsewhere:
@@ -103,8 +117,45 @@ func (p *plugin) shouldSkip(db *gorm.DB) bool {
 	return skip
 }
 
+// schemaOnlyMode returns true when at least one field on the schema is tagged
+// `auditable:"only"`. When true, only those fields appear in the audit entry.
+func schemaOnlyMode(s *gorm.Statement) bool {
+	if s.Schema == nil {
+		return false
+	}
+	for _, f := range s.Schema.Fields {
+		if f.Tag.Get("auditable") == "only" {
+			return true
+		}
+	}
+	return false
+}
+
+// includeField decides whether a field belongs in the audit entry.
+//
+//	`auditable:"only"`   — include (whitelist mode; all untagged fields are dropped)
+//	`auditable:"redact"` — include but obscure the value
+//	`auditable:"false"`  — always skip
+//	(no tag)             — include unless onlyMode is active
+func includeField(tag string, onlyMode bool) bool {
+	if tag == "false" {
+		return false
+	}
+	if onlyMode && tag != "only" && tag != "redact" {
+		return false
+	}
+	return true
+}
+
 func (p *plugin) resolveUserID(db *gorm.DB) *string {
-	s, ok := UserIDFromContext(db.Statement.Context)
+	ctx := db.Statement.Context
+	if p.config.UserIDResolver != nil {
+		if s, ok := p.config.UserIDResolver(ctx); ok {
+			return &s
+		}
+		return nil
+	}
+	s, ok := UserIDFromContext(ctx)
 	if !ok {
 		return nil
 	}
@@ -157,6 +208,8 @@ func (p *plugin) persist(db *gorm.DB, a *Audit) {
 	if db.Statement != nil && db.Statement.Context != nil {
 		ctx = db.Statement.Context
 	}
+	// Inject the callback db so GormStore can join the active transaction.
+	ctx = withGormTx(ctx, db)
 	r := &AuditRecord{
 		AuditableID:    a.AuditableID,
 		AuditableType:  a.AuditableType,
@@ -188,6 +241,8 @@ func (p *plugin) nextVersion(db *gorm.DB, auditableType, auditableID string) uin
 	if db.Statement != nil && db.Statement.Context != nil {
 		ctx = db.Statement.Context
 	}
+	// Inject the callback db so GormStore can join the active transaction.
+	ctx = withGormTx(ctx, db)
 	v, err := p.store.NextVersion(ctx, auditableType, auditableID)
 	if err != nil {
 		p.handleError(err)
@@ -225,19 +280,22 @@ func (p *plugin) auditFromMap(db *gorm.DB, userID, comment *string) {
 	}
 
 	destMap := db.Statement.Dest.(map[string]interface{})
+	onlyMode := schemaOnlyMode(db.Statement)
 	changes := make(datatypes.JSONMap, len(destMap))
 	for col, newVal := range destMap {
 		tag := ""
+		dbCol := col
 		if f := schema.LookUpField(col); f != nil {
 			tag = f.Tag.Get("auditable")
+			dbCol = f.DBName
 		}
-		if tag == "false" {
+		if !includeField(tag, onlyMode) {
 			continue
 		}
 		if tag == "redact" {
-			changes[col] = []interface{}{p.config.RedactedValue, p.config.RedactedValue}
+			changes[dbCol] = []interface{}{p.config.RedactedValue, p.config.RedactedValue}
 		} else {
-			changes[col] = []interface{}{nil, newVal}
+			changes[dbCol] = []interface{}{nil, newVal}
 		}
 	}
 	if len(changes) == 0 {
@@ -277,12 +335,13 @@ func (p *plugin) auditFromChangedCols(db *gorm.DB, userID, comment *string) {
 	}
 
 	changes := make(datatypes.JSONMap)
+	onlyMode := schemaOnlyMode(db.Statement)
 	for _, f := range schema.Fields {
 		if !db.Statement.Changed(f.Name) {
 			continue
 		}
 		tag := f.Tag.Get("auditable")
-		if tag == "false" {
+		if !includeField(tag, onlyMode) {
 			continue
 		}
 		newVal, _ := f.ValueOf(db.Statement.Context, modelVal)
@@ -326,14 +385,15 @@ func (p *plugin) auditSingle(db *gorm.DB, rv reflect.Value, action Action, userI
 	}
 
 	changes := make(datatypes.JSONMap)
+	onlyMode := schemaOnlyMode(db.Statement)
 	for _, field := range schema.Fields {
 		tag := field.Tag.Get("auditable")
-		if tag == "false" {
-			continue
-		}
 		// Timestamps are infrastructure noise — skip them.
 		switch field.Name {
 		case "CreatedAt", "UpdatedAt", "DeletedAt":
+			continue
+		}
+		if !includeField(tag, onlyMode) {
 			continue
 		}
 

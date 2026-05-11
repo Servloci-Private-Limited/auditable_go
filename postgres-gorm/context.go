@@ -18,6 +18,18 @@ func UserIDFromContext(ctx context.Context) (string, bool) {
 	return userIDFromContext(ctx, defaultUserIDContextKey)
 }
 
+// ExtractUserID reads a user ID stored under key from ctx and converts it to a
+// string. It handles string, []byte, fmt.Stringer, and any numeric type
+// (int, int64, uint, uint64, …) — so both integer and string primary keys work
+// without an explicit type assertion in your UserIDResolver:
+//
+//	UserIDResolver: func(ctx context.Context) (string, bool) {
+//	    return auditablegorm.ExtractUserID(ctx, myMiddleware.UserKey)
+//	}
+func ExtractUserID(ctx context.Context, key any) (string, bool) {
+	return userIDFromContext(ctx, key)
+}
+
 func WithComment(ctx context.Context, comment string) context.Context {
 	return context.WithValue(ctx, defaultCommentContextKey, comment)
 }

@@ -21,6 +21,17 @@ func UserIDFromContext(ctx context.Context) (string, bool) {
 	return valueFromContext(ctx, defaultUserIDContextKey)
 }
 
+// ExtractUserID reads the value at key from ctx and converts it to a string.
+// Handles string, int, uint, int64, fmt.Stringer, []byte — use this in
+// UserIDResolver to read whatever key your auth middleware already sets:
+//
+//	UserIDResolver: func(ctx context.Context) (string, bool) {
+//	    return mongoaudit.ExtractUserID(ctx, myMiddleware.UserKey)
+//	}
+func ExtractUserID(ctx context.Context, key any) (string, bool) {
+	return valueFromContext(ctx, key)
+}
+
 // WithComment attaches a human-readable reason for the change to the context.
 func WithComment(ctx context.Context, comment string) context.Context {
 	return context.WithValue(ctx, defaultCommentContextKey, comment)

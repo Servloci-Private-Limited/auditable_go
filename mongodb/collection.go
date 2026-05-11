@@ -16,6 +16,7 @@ import (
 	"context"
 	"fmt"
 	"reflect"
+	"strings"
 	"time"
 
 	"go.mongodb.org/mongo-driver/v2/bson"
@@ -56,6 +57,18 @@ type Config struct {
 	// up audit metadata fails. Mutating MongoDB methods keep their original
 	// driver signatures, so audit-only errors are reported here.
 	OnError func(error)
+
+	// UserIDResolver, when set, is called to extract the acting user from the
+	// request context. Equivalent to the GORM plugin's UserIDResolver:
+	//
+	//   auditor := mongoaudit.NewAuditor(db, "audits", mongoaudit.Config{
+	//       UserIDResolver: func(ctx context.Context) (string, bool) {
+	//           return mongoaudit.ExtractUserID(ctx, myMiddleware.UserKey)
+	//       },
+	//   })
+	//
+	// When nil the auditor falls back to the value stored by WithUserID.
+	UserIDResolver func(ctx context.Context) (string, bool)
 }
 
 // Auditor owns the audit collection and configuration for a MongoDB database.
@@ -135,6 +148,121 @@ func normalizeConfig(cfg Config) Config {
 	return cfg
 }
 
+// -------------------------------------------------------------------
+// Struct-tag audit helpers
+// -------------------------------------------------------------------
+
+// structAuditInfo holds per-struct field filtering derived from `auditable` tags.
+type structAuditInfo struct {
+	redacted map[string]struct{}
+	skip     map[string]struct{}
+	only     map[string]struct{} // nil = include all (no whitelist)
+}
+
+// auditTagsFromStruct reads `auditable` struct tags and returns sets for
+// redacted, skipped, and whitelist-only fields. Mirrors the GORM plugin's
+// includeField / schemaOnlyMode logic.
+func auditTagsFromStruct(v interface{}) structAuditInfo {
+	info := structAuditInfo{
+		redacted: make(map[string]struct{}),
+		skip:     make(map[string]struct{}),
+	}
+	rv := reflect.ValueOf(v)
+	if rv.Kind() == reflect.Ptr {
+		rv = rv.Elem()
+	}
+	if rv.Kind() != reflect.Struct {
+		return info
+	}
+	var hasOnly bool
+	collectStructTags(rv.Type(), &info, &hasOnly)
+	if !hasOnly {
+		info.only = nil
+	}
+	return info
+}
+
+func collectStructTags(t reflect.Type, info *structAuditInfo, hasOnly *bool) {
+	for i := 0; i < t.NumField(); i++ {
+		field := t.Field(i)
+		bsonTag := field.Tag.Get("bson")
+
+		// Recurse into inline / anonymous embedded structs.
+		if bsonTag == ",inline" || (field.Anonymous && bsonTag == "") {
+			ft := field.Type
+			if ft.Kind() == reflect.Ptr {
+				ft = ft.Elem()
+			}
+			if ft.Kind() == reflect.Struct {
+				collectStructTags(ft, info, hasOnly)
+			}
+			continue
+		}
+
+		// Determine BSON field name.
+		bsonName := strings.ToLower(field.Name)
+		if bsonTag != "" {
+			if parts := strings.SplitN(bsonTag, ",", 2); parts[0] != "" && parts[0] != "-" {
+				bsonName = parts[0]
+			}
+		}
+
+		switch field.Tag.Get("auditable") {
+		case "false":
+			info.skip[bsonName] = struct{}{}
+		case "redact":
+			info.redacted[bsonName] = struct{}{}
+		case "only":
+			if info.only == nil {
+				info.only = make(map[string]struct{})
+			}
+			info.only[bsonName] = struct{}{}
+			*hasOnly = true
+		}
+	}
+}
+
+// setDocumentTimestamps sets CreatedAt and UpdatedAt on a pointer-to-struct
+// document when those fields are zero. Equivalent to GORM's autoCreateTime /
+// autoUpdateTime — callers do not need to set timestamps manually.
+func setDocumentTimestamps(v interface{}) {
+	rv := reflect.ValueOf(v)
+	if rv.Kind() != reflect.Ptr {
+		return
+	}
+	rv = rv.Elem()
+	if rv.Kind() != reflect.Struct {
+		return
+	}
+	now := time.Now()
+	timeType := reflect.TypeOf(time.Time{})
+	for _, name := range []string{"CreatedAt", "UpdatedAt"} {
+		f := rv.FieldByName(name)
+		if f.IsValid() && f.CanSet() && f.Type() == timeType {
+			if f.Interface().(time.Time).IsZero() {
+				f.Set(reflect.ValueOf(now))
+			}
+		}
+	}
+}
+
+func mergeStringSets(a, b map[string]struct{}) map[string]struct{} {
+	if len(b) == 0 {
+		return a
+	}
+	if len(a) == 0 {
+		return b
+	}
+	merged := make(map[string]struct{}, len(a)+len(b))
+	for k := range a {
+		merged[k] = struct{}{}
+	}
+	for k := range b {
+		merged[k] = struct{}{}
+	}
+	return merged
+}
+
 // EnsureAuditIndexes creates the recommended indexes for an audit collection.
 // It can be used by both direct MongoDB auditing and GORM auditing backed by
 // NewMongoStore.
@@ -165,6 +293,7 @@ func (a *AuditableCollection) Collection() *mongo.Collection { return a.coll }
 
 // InsertOne inserts a single document and records a create audit entry.
 func (a *AuditableCollection) InsertOne(ctx context.Context, document interface{}, opts ...options.Lister[options.InsertOneOptions]) (*mongo.InsertOneResult, error) {
+	setDocumentTimestamps(document)
 	result, err := a.coll.InsertOne(ctx, document, opts...)
 	if err != nil {
 		return result, err
@@ -173,7 +302,10 @@ func (a *AuditableCollection) InsertOne(ctx context.Context, document interface{
 	docMap, merr := toMap(document)
 	if merr == nil {
 		id := fmt.Sprint(result.InsertedID)
-		changes := createChanges(docMap, a.config.SkipFields, a.config.RedactedFields, a.config.RedactedValue)
+		tags := auditTagsFromStruct(document)
+		skip := mergeStringSets(a.config.SkipFields, tags.skip)
+		redacted := mergeStringSets(a.config.RedactedFields, tags.redacted)
+		changes := createChanges(docMap, skip, redacted, a.config.RedactedValue, tags.only)
 		a.persist(ctx, a.buildAudit(ctx, id, ActionCreate, changes))
 	} else {
 		a.handleError(merr)
@@ -184,6 +316,9 @@ func (a *AuditableCollection) InsertOne(ctx context.Context, document interface{
 // InsertMany inserts multiple documents and records one create audit entry per
 // inserted document.
 func (a *AuditableCollection) InsertMany(ctx context.Context, documents []interface{}, opts ...options.Lister[options.InsertManyOptions]) (*mongo.InsertManyResult, error) {
+	for _, doc := range documents {
+		setDocumentTimestamps(doc)
+	}
 	result, err := a.coll.InsertMany(ctx, documents, opts...)
 	if err != nil {
 		return result, err
@@ -199,7 +334,10 @@ func (a *AuditableCollection) InsertMany(ctx context.Context, documents []interf
 		if i < len(result.InsertedIDs) {
 			id = fmt.Sprint(result.InsertedIDs[i])
 		}
-		changes := createChanges(docMap, a.config.SkipFields, a.config.RedactedFields, a.config.RedactedValue)
+		tags := auditTagsFromStruct(doc)
+		skip := mergeStringSets(a.config.SkipFields, tags.skip)
+		redacted := mergeStringSets(a.config.RedactedFields, tags.redacted)
+		changes := createChanges(docMap, skip, redacted, a.config.RedactedValue, tags.only)
 		a.persist(ctx, a.buildAudit(ctx, id, ActionCreate, changes))
 	}
 	return result, nil
@@ -379,7 +517,7 @@ func (a *AuditableCollection) handleError(err error) {
 }
 
 func (a *AuditableCollection) buildAudit(ctx context.Context, id string, action Action, changes bson.M) *Audit {
-	uid := resolveUserID(ctx)
+	uid := a.resolveUserID(ctx)
 	comment := resolveComment(ctx)
 	return &Audit{
 		AuditableID:    id,
@@ -444,6 +582,18 @@ func (a *AuditableCollection) findMany(ctx context.Context, filter interface{}) 
 // -------------------------------------------------------------------
 // Context helpers
 // -------------------------------------------------------------------
+
+// resolveUserID returns the acting user from the request context.
+// It tries UserIDResolver first, then falls back to WithUserID.
+func (a *AuditableCollection) resolveUserID(ctx context.Context) *string {
+	if a.config.UserIDResolver != nil {
+		if s, ok := a.config.UserIDResolver(ctx); ok {
+			return &s
+		}
+		return nil
+	}
+	return resolveUserID(ctx)
+}
 
 func resolveUserID(ctx context.Context) *string {
 	s, ok := UserIDFromContext(ctx)
@@ -554,7 +704,8 @@ func extractUpdateChanges(update interface{}, skip map[string]struct{}, redacted
 
 // createChanges builds the audited_changes map for an insert.
 // Each field is recorded as [nil, value], matching the GORM audit payload.
-func createChanges(doc bson.M, skip map[string]struct{}, redacted map[string]struct{}, redactedVal string) bson.M {
+// When only is non-nil (whitelist mode), fields absent from it are dropped.
+func createChanges(doc bson.M, skip map[string]struct{}, redacted map[string]struct{}, redactedVal string, only map[string]struct{}) bson.M {
 	changes := make(bson.M, len(doc))
 	for k, v := range doc {
 		if k == "_id" {
@@ -562,6 +713,11 @@ func createChanges(doc bson.M, skip map[string]struct{}, redacted map[string]str
 		}
 		if _, s := skip[k]; s {
 			continue
+		}
+		if only != nil {
+			if _, ok := only[k]; !ok {
+				continue
+			}
 		}
 		if _, r := redacted[k]; r {
 			changes[k] = bson.A{nil, redactedVal}

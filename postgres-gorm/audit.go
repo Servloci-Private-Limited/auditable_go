@@ -4,7 +4,24 @@ import (
 	"time"
 
 	"gorm.io/datatypes"
+	"gorm.io/gorm"
 )
+
+// Model is a GORM base model. Embed it in any domain struct to get
+// gorm.Model's fields (ID uint, CreatedAt, UpdatedAt, DeletedAt) plus full
+// audit tracking — identical to the Rails `audited` gem pattern:
+//
+//	type Article struct {
+//	    auditablegorm.Model
+//	    Title  string `gorm:"not null"`
+//	    Status string `gorm:"default:'draft'"`
+//	}
+//
+// Register the plugin once and every create/update/delete on any model that
+// embeds auditablegorm.Model is automatically tracked.
+type Model struct {
+	gorm.Model
+}
 
 type Action string
 
@@ -28,4 +45,12 @@ type Audit struct {
 
 func (Audit) TableName() string {
 	return "audits"
+}
+
+// Migrate creates or updates the audits table. Call once at startup alongside
+// your own db.AutoMigrate(...) — no need to reference &Audit{} directly:
+//
+//	auditablegorm.Migrate(db)
+func Migrate(db *gorm.DB) error {
+	return db.AutoMigrate(&Audit{})
 }

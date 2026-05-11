@@ -8,6 +8,16 @@ import (
 	"gorm.io/gorm"
 )
 
+// gormTxKey is the context key used to propagate the callback *gorm.DB
+// (which carries an active transaction) to GormStore so that audit writes
+// participate in the same transaction as the data change.
+type gormTxKey struct{}
+
+// withGormTx injects db into ctx so the GormStore can join the transaction.
+func withGormTx(ctx context.Context, db *gorm.DB) context.Context {
+	return context.WithValue(ctx, gormTxKey{}, db)
+}
+
 // AuditRecord is a storage-neutral snapshot of a single audit event produced
 // by the GORM plugin. It contains no GORM tags so any store backend can consume
 // it without a GORM dependency.
@@ -56,8 +66,18 @@ func NewGormStore(db *gorm.DB, tableName string) *GormStore {
 	return &GormStore{db: db, tableName: tableName}
 }
 
+// conn returns a clean *gorm.DB for a store operation.
+// When a transaction db was injected via withGormTx, a new session is created
+// from it so the statement is reset while the transaction connection is kept.
+func (s *GormStore) conn(ctx context.Context) *gorm.DB {
+	if tx, ok := ctx.Value(gormTxKey{}).(*gorm.DB); ok && tx != nil {
+		return tx.Session(&gorm.Session{NewDB: true})
+	}
+	return s.db.Session(&gorm.Session{NewDB: true})
+}
+
 // Save converts the AuditRecord to the GORM Audit model and inserts it.
-func (s *GormStore) Save(_ context.Context, r *AuditRecord) error {
+func (s *GormStore) Save(ctx context.Context, r *AuditRecord) error {
 	a := &Audit{
 		AuditableID:    r.AuditableID,
 		AuditableType:  r.AuditableType,
@@ -68,14 +88,14 @@ func (s *GormStore) Save(_ context.Context, r *AuditRecord) error {
 		Comment:        r.Comment,
 		CreatedAt:      r.CreatedAt,
 	}
-	return s.db.Session(&gorm.Session{NewDB: true}).Table(s.tableName).Create(a).Error
+	return s.conn(ctx).Table(s.tableName).Create(a).Error
 }
 
 // NextVersion queries the SQL audit table for the current maximum version of
 // the entity and returns max+1.
-func (s *GormStore) NextVersion(_ context.Context, auditableType, auditableID string) (uint64, error) {
+func (s *GormStore) NextVersion(ctx context.Context, auditableType, auditableID string) (uint64, error) {
 	var v uint64
-	result := s.db.Session(&gorm.Session{NewDB: true}).
+	result := s.conn(ctx).
 		Model(&Audit{}).
 		Table(s.tableName).
 		Where("auditable_type = ? AND auditable_id = ?", auditableType, auditableID).

@@ -128,7 +128,7 @@ type VoterVidhansabhaDetails struct {
 }
 
 type VoterBase struct {
-	ID           string `bson:"_id,omitempty" json:"id,omVoterResponseitempty"`
+	ID           string `bson:"_id,omitempty" json:"id,omitempty"`
 	Name         string `bson:"name,omitempty" json:"name,omitempty"`
 	RelationName string `bson:"relation_name,omitempty" json:"relation_name,omitempty"`
 	RelationType string `bson:"relation_type,omitempty" json:"relation_type,omitempty"`
