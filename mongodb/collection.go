@@ -96,8 +96,29 @@ func NewAuditor(db *mongo.Database, auditCollectionName string, cfg Config) *Aud
 }
 
 // Collection wraps db.Collection(name) with auditing enabled.
+// All operations (create, update, delete) are audited.
 func (a *Auditor) Collection(name string) *AuditableCollection {
 	return a.Wrap(a.db.Collection(name))
+}
+
+// CollectionFor wraps db.Collection(name) and reads the CRUD ops flag from
+// the embedded mongoaudit.Model field of example to decide which operations
+// generate audit entries. Pass a zero value of your document type:
+//
+//	type Voter struct {
+//	    mongoaudit.Model `bson:",inline" auditable:"create,update"`
+//	    ...
+//	}
+//	voters := auditor.CollectionFor("voters", &Voter{})
+//	// voters.DeleteOne will now skip the audit silently.
+//
+// When the embedded Model has no auditable tag CollectionFor behaves the same
+// as Collection (all ops audited).
+func (a *Auditor) CollectionFor(name string, example interface{}) *AuditableCollection {
+	c := a.Wrap(a.db.Collection(name))
+	info := auditTagsFromStruct(example)
+	c.ops = info.ops
+	return c
 }
 
 // Wrap wraps an existing collection with this auditor's audit collection and
@@ -121,6 +142,17 @@ type AuditableCollection struct {
 	coll      *mongo.Collection
 	auditColl *mongo.Collection
 	config    Config
+	ops       map[string]struct{} // nil = all ops; set by CollectionFor
+}
+
+// allowsOp reports whether this collection should emit an audit entry for the
+// given action. Always returns true when ops is nil (the default from Collection).
+func (a *AuditableCollection) allowsOp(action Action) bool {
+	if a.ops == nil {
+		return true
+	}
+	_, ok := a.ops[string(action)]
+	return ok
 }
 
 // Wrap returns an AuditableCollection backed by coll. Audit documents are
@@ -157,6 +189,7 @@ type structAuditInfo struct {
 	redacted map[string]struct{}
 	skip     map[string]struct{}
 	only     map[string]struct{} // nil = include all (no whitelist)
+	ops      map[string]struct{} // nil = all ops; non-nil = only these op names
 }
 
 // auditTagsFromStruct reads `auditable` struct tags and returns sets for
@@ -188,7 +221,12 @@ func collectStructTags(t reflect.Type, info *structAuditInfo, hasOnly *bool) {
 		bsonTag := field.Tag.Get("bson")
 
 		// Recurse into inline / anonymous embedded structs.
+		// Also read any CRUD ops flag on the embed field itself:
+		//   mongoaudit.Model `bson:",inline" auditable:"create,update"`
 		if bsonTag == ",inline" || (field.Anonymous && bsonTag == "") {
+			if auditTag := field.Tag.Get("auditable"); auditTag != "" {
+				parseOpsTag(auditTag, info)
+			}
 			ft := field.Type
 			if ft.Kind() == reflect.Ptr {
 				ft = ft.Elem()
@@ -208,11 +246,13 @@ func collectStructTags(t reflect.Type, info *structAuditInfo, hasOnly *bool) {
 		}
 
 		switch field.Tag.Get("auditable") {
-		case "false":
+		case "-", "false":
+			// skip — never record this field
 			info.skip[bsonName] = struct{}{}
 		case "redact":
 			info.redacted[bsonName] = struct{}{}
-		case "only":
+		case "true", "only":
+			// whitelist — only tagged fields appear in audit entries
 			if info.only == nil {
 				info.only = make(map[string]struct{})
 			}
@@ -263,6 +303,22 @@ func mergeStringSets(a, b map[string]struct{}) map[string]struct{} {
 	return merged
 }
 
+// parseOpsTag parses a comma-separated CRUD ops value (e.g. "create,update")
+// and populates info.ops. Only "create", "update", and "delete" are recognised;
+// unrecognised tokens are silently ignored so that field-level tags on regular
+// fields are unaffected.
+func parseOpsTag(tag string, info *structAuditInfo) {
+	for _, p := range strings.Split(tag, ",") {
+		switch strings.TrimSpace(strings.ToLower(p)) {
+		case "create", "update", "delete":
+			if info.ops == nil {
+				info.ops = make(map[string]struct{})
+			}
+			info.ops[strings.TrimSpace(strings.ToLower(p))] = struct{}{}
+		}
+	}
+}
+
 // EnsureAuditIndexes creates the recommended indexes for an audit collection.
 // It can be used by both direct MongoDB auditing and GORM auditing backed by
 // NewMongoStore.
@@ -298,6 +354,9 @@ func (a *AuditableCollection) InsertOne(ctx context.Context, document interface{
 	if err != nil {
 		return result, err
 	}
+	if !a.allowsOp(ActionCreate) {
+		return result, nil
+	}
 
 	docMap, merr := toMap(document)
 	if merr == nil {
@@ -322,6 +381,9 @@ func (a *AuditableCollection) InsertMany(ctx context.Context, documents []interf
 	result, err := a.coll.InsertMany(ctx, documents, opts...)
 	if err != nil {
 		return result, err
+	}
+	if !a.allowsOp(ActionCreate) {
+		return result, nil
 	}
 
 	for i, doc := range documents {
@@ -359,7 +421,7 @@ func (a *AuditableCollection) UpdateOne(ctx context.Context, filter interface{},
 	if err != nil {
 		return result, err
 	}
-	if result.MatchedCount == 0 {
+	if result.MatchedCount == 0 || !a.allowsOp(ActionUpdate) {
 		return result, nil
 	}
 
@@ -393,7 +455,7 @@ func (a *AuditableCollection) UpdateMany(ctx context.Context, filter interface{}
 	if err != nil {
 		return result, err
 	}
-	if result.MatchedCount == 0 {
+	if result.MatchedCount == 0 || !a.allowsOp(ActionUpdate) {
 		return result, nil
 	}
 
@@ -416,7 +478,7 @@ func (a *AuditableCollection) ReplaceOne(ctx context.Context, filter interface{}
 	if err != nil {
 		return result, err
 	}
-	if result.MatchedCount == 0 {
+	if result.MatchedCount == 0 || !a.allowsOp(ActionUpdate) {
 		return result, nil
 	}
 
@@ -442,7 +504,7 @@ func (a *AuditableCollection) DeleteOne(ctx context.Context, filter interface{},
 	if err != nil {
 		return result, err
 	}
-	if result.DeletedCount == 0 {
+	if result.DeletedCount == 0 || !a.allowsOp(ActionDelete) {
 		return result, nil
 	}
 
@@ -463,7 +525,7 @@ func (a *AuditableCollection) DeleteMany(ctx context.Context, filter interface{}
 	if err != nil {
 		return result, err
 	}
-	if result.DeletedCount == 0 {
+	if result.DeletedCount == 0 || !a.allowsOp(ActionDelete) {
 		return result, nil
 	}
 

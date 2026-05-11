@@ -118,13 +118,14 @@ func (p *plugin) shouldSkip(db *gorm.DB) bool {
 }
 
 // schemaOnlyMode returns true when at least one field on the schema is tagged
-// `auditable:"only"`. When true, only those fields appear in the audit entry.
+// `auditable:"only"` or `auditable:"true"`. When true, only those fields appear
+// in the audit entry.
 func schemaOnlyMode(s *gorm.Statement) bool {
 	if s.Schema == nil {
 		return false
 	}
 	for _, f := range s.Schema.Fields {
-		if f.Tag.Get("auditable") == "only" {
+		if t := f.Tag.Get("auditable"); t == "only" || t == "true" {
 			return true
 		}
 	}
@@ -133,15 +134,15 @@ func schemaOnlyMode(s *gorm.Statement) bool {
 
 // includeField decides whether a field belongs in the audit entry.
 //
-//	`auditable:"only"`   — include (whitelist mode; all untagged fields are dropped)
+//	`auditable:"true"` / `auditable:"only"`   — whitelist; all untagged fields dropped
 //	`auditable:"redact"` — include but obscure the value
-//	`auditable:"false"`  — always skip
+//	`auditable:"-"` / `auditable:"false"`     — always skip
 //	(no tag)             — include unless onlyMode is active
 func includeField(tag string, onlyMode bool) bool {
-	if tag == "false" {
+	if tag == "-" || tag == "false" {
 		return false
 	}
-	if onlyMode && tag != "only" && tag != "redact" {
+	if onlyMode && tag != "only" && tag != "true" && tag != "redact" {
 		return false
 	}
 	return true

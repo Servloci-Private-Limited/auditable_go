@@ -36,21 +36,22 @@ import (
 //   auditable:"false"   field is never recorded
 // --------------------------------------------------------------------------
 
-// Voter — full audit; EpicNumber is redacted.
+// Voter — auditable:"create,update" on the embedded Model means delete is NOT
+// audited. auditable:"true" whitelists a field. auditable:"-" skips it entirely.
 type Voter struct {
-	mongoaudit.Model `bson:",inline"`
+	mongoaudit.Model `bson:",inline" auditable:"create,update"`
 	Name             string `bson:"name"`
-	EpicNumber       string `bson:"epic_number" auditable:"redact"`
-	Age              int    `bson:"age"`
-	Status           string `bson:"status"`
+	EpicNumber       string `bson:"epic_number" auditable:"redact"` // stored as [REDACTED]
+	Age              int    `bson:"age"         auditable:"true"`   // whitelist: only audited field
+	Status           string `bson:"status"      auditable:"-"`      // never recorded
 }
 
-// Campaign — whitelist: only Name and Status are audited.
+// Campaign — no CRUD gate (all ops audited). auditable:"true" whitelists fields.
 type Campaign struct {
 	mongoaudit.Model `bson:",inline"`
-	Name             string `bson:"name"       auditable:"only"`
-	Status           string `bson:"status"     auditable:"only"`
-	ProgramID        int    `bson:"program_id"` // not audited — no "only" tag
+	Name             string `bson:"name"       auditable:"true"`
+	Status           string `bson:"status"     auditable:"true"`
+	ProgramID        int    `bson:"program_id"` // not audited — no "true" tag
 }
 
 // --------------------------------------------------------------------------
@@ -93,8 +94,8 @@ func main() {
 		log.Fatal("audit indexes:", err)
 	}
 
-	voters := auditor.Collection("voters")
-	campaigns := auditor.Collection("campaigns")
+	voters := auditor.CollectionFor("voters", &Voter{})          // CRUD ops gated by Voter's Model tag
+	campaigns := auditor.CollectionFor("campaigns", &Campaign{}) // all ops (no gate)
 
 	// Every operation below uses a plain context.WithValue context.
 	// The auditor reads the user automatically — no WithUserID calls needed.
