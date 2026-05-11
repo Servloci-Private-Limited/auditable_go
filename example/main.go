@@ -20,27 +20,28 @@ import (
 //
 // 2. Control per-field audit behaviour with the `auditable` struct tag:
 //
-//    auditable:"only"    whitelist: only tagged fields appear in audit entries
+//    auditable:"true"    whitelist: only tagged fields appear in audit entries
 //    auditable:"redact"  value stored as [REDACTED] (e.g. passwords, tokens)
-//    auditable:"false"   field is never recorded
-//    (no tag)            always recorded, unless another field has "only"
+//    auditable:"-"       field is never recorded
+//    (no tag)            always recorded, unless another field has "true"
 // --------------------------------------------------------------------------
 
 // Article — whitelist: only Title and Status are audited.
 // ViewCount changes are silently ignored.
 type Article struct {
 	auditable.Model
-	Title     string `gorm:"not null"        auditable:"only"`
-	Status    string `gorm:"default:'draft'" auditable:"only"`
+	Title     string `gorm:"not null"        auditable:"true"`
+	Status    string `gorm:"default:'draft'" auditable:"true"`
 	ViewCount int
 }
 
-// User — full audit; Password is redacted.
+// User — full audit; Password is redacted, InternalNote is never recorded.
 type User struct {
 	auditable.Model
-	Name     string `gorm:"not null"`
-	Email    string `gorm:"uniqueIndex;not null"`
-	Password string `gorm:"not null" auditable:"redact"`
+	Name         string `gorm:"not null"`
+	Email        string `gorm:"uniqueIndex;not null"`
+	Password     string `gorm:"not null" auditable:"redact"`
+	InternalNote string `gorm:"size:500"  auditable:"-"`
 }
 
 // Comment — full audit, no special rules.

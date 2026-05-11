@@ -29,11 +29,18 @@ import (
 // Embed mongoaudit.Model with `bson:",inline"` — you get _id, created_at,
 // updated_at, deleted_at and full audit tracking automatically.
 //
-// Use the same `auditable` struct tags as the GORM package:
+// `auditable` struct tags (identical to the GORM package):
 //
-//   auditable:"only"    whitelist: only tagged fields appear in audit entries
+//   auditable:"true"    whitelist: only tagged fields appear in audit entries
 //   auditable:"redact"  value stored as [REDACTED]
-//   auditable:"false"   field is never recorded
+//   auditable:"-"       field is never recorded
+//   (no tag)            always recorded, unless another field has "true"
+//
+// CRUD op gating on the embedded Model field (MongoDB only):
+//
+//   mongoaudit.Model `bson:",inline" auditable:"create,update"`
+//   → delete operations produce no audit entry for this collection.
+//   Use auditor.CollectionFor("col", &T{}) to apply the gate.
 // --------------------------------------------------------------------------
 
 // Voter — auditable:"create,update" on the embedded Model means delete is NOT
