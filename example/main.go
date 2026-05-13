@@ -51,6 +51,32 @@ type Comment struct {
 	ArticleID uint   `gorm:"not null"`
 }
 
+// Category — whitelist: only Name and Slug are audited.
+// DisplayOrder changes are silently ignored.
+type Category struct {
+	auditable.Model
+	Name         string `gorm:"not null"          auditable:"true"`
+	Slug         string `gorm:"uniqueIndex;not null" auditable:"true"`
+	DisplayOrder int
+}
+
+// Product — full audit; APIKey is redacted, InternalSKU is never recorded.
+type Product struct {
+	auditable.Model
+	Name        string  `gorm:"not null"`
+	Price       float64 `gorm:"not null"`
+	CategoryID  uint    `gorm:"not null"`
+	APIKey      string  `gorm:"size:128" auditable:"redact"`
+	InternalSKU string  `gorm:"size:64"  auditable:"-"`
+}
+
+// Tag — full audit, no special rules. Demonstrates batch soft-delete.
+type Tag struct {
+	auditable.Model
+	Name      string `gorm:"uniqueIndex;not null"`
+	ArticleID uint   `gorm:"not null"`
+}
+
 // --------------------------------------------------------------------------
 // Context key — set once by your auth middleware, read by the plugin.
 // Accepts any type: string, int, uint, int64 …
@@ -88,7 +114,7 @@ func main() {
 
 	// Migrate — creates the audits table + your own tables.
 	auditable.Migrate(db)
-	db.AutoMigrate(&Article{}, &User{}, &Comment{})
+	db.AutoMigrate(&Article{}, &User{}, &Comment{}, &Category{}, &Product{}, &Tag{})
 
 	// Every operation below uses db.WithContext(ctx).
 	// The plugin reads the user automatically — no extra calls needed.
@@ -114,6 +140,95 @@ func main() {
 	d.Create(comment)
 
 	d.Model(comment).Update("Body", "Great article! (edited)")
+
+	// ── Category: soft delete + query deleted + restore ───────────────────
+	//
+	// gorm.Model embeds DeletedAt (gorm.DeletedAt). d.Delete() sets it;
+	// normal queries exclude it; Unscoped() bypasses the filter.
+
+	cat := &Category{Name: "Technology", Slug: "technology", DisplayOrder: 1}
+	d.Create(cat)
+	d.Model(cat).Updates(map[string]any{"name": "Tech", "slug": "tech"})
+
+	// Soft-delete the category.
+	d.Delete(cat) // sets deleted_at, audit action = "delete"
+
+	// Query — soft-deleted rows are invisible by default.
+	var visible []Category
+	d.Find(&visible)
+	fmt.Printf("\nVisible categories after soft-delete: %d\n", len(visible)) // 0
+
+	// Query including soft-deleted rows.
+	var all []Category
+	d.Unscoped().Find(&all)
+	fmt.Printf("All categories (Unscoped): %d\n", len(all)) // 1
+
+	// Restore: clear DeletedAt.
+	d.Unscoped().Model(cat).Update("DeletedAt", nil)
+	d.Find(&visible)
+	fmt.Printf("Visible categories after restore: %d\n", len(visible)) // 1
+
+	// ── Product: redaction + soft delete ─────────────────────────────────
+
+	prod := &Product{
+		Name:        "Widget Pro",
+		Price:       49.99,
+		CategoryID:  cat.ID,
+		APIKey:      "sk-live-secret123",
+		InternalSKU: "WDG-001",
+	}
+	d.Create(prod) // APIKey → [REDACTED], InternalSKU never recorded
+
+	d.Model(prod).Updates(map[string]any{"price": 39.99, "name": "Widget Pro (Sale)"})
+	d.Delete(prod) // soft-delete; [REDACTED] kept in audit log, InternalSKU absent
+
+	// ── Tag: batch soft-delete ────────────────────────────────────────────
+	//
+	// Create several tags for the article, then delete them all at once.
+	// Each individual row gets its own audit entry (one per affected ID).
+
+	article2 := &Article{Title: "Batch Demo", Status: "draft"}
+	d.Create(article2)
+
+	tags := []Tag{
+		{Name: "go", ArticleID: article2.ID},
+		{Name: "audit", ArticleID: article2.ID},
+		{Name: "gorm", ArticleID: article2.ID},
+	}
+	d.Create(&tags)
+
+	// Batch soft-delete all tags belonging to article2.
+	d.Where("article_id = ?", article2.ID).Delete(&Tag{})
+
+	// Confirm: no visible tags remain for that article.
+	var remainingTags []Tag
+	d.Where("article_id = ?", article2.ID).Find(&remainingTags)
+	fmt.Printf("\nVisible tags after batch soft-delete: %d\n", len(remainingTags)) // 0
+
+	// Hard-delete one specific tag permanently (no soft-delete protection).
+	d.Unscoped().Delete(&tags[0])
+
+	// ── Soft delete inside a transaction ──────────────────────────────────
+	//
+	// Deletes and their audit rows are committed or rolled back atomically.
+
+	article3 := &Article{Title: "To Be Purged", Status: "draft"}
+	d.Create(article3)
+	comment2 := &Comment{Body: "Spam comment", ArticleID: article3.ID}
+	d.Create(comment2)
+
+	err = d.Transaction(func(tx *gorm.DB) error {
+		if err := tx.Delete(comment2).Error; err != nil { // soft-delete comment
+			return err
+		}
+		if err := tx.Delete(article3).Error; err != nil { // soft-delete article
+			return err
+		}
+		return nil // both soft-deletes + audit rows committed atomically
+	})
+	if err != nil {
+		log.Println("transaction failed:", err)
+	}
 
 	// ── transaction ───────────────────────────────────────────────────────
 	//

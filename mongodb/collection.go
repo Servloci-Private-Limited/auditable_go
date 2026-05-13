@@ -537,6 +537,47 @@ func (a *AuditableCollection) DeleteMany(ctx context.Context, filter interface{}
 	return result, nil
 }
 
+// SoftDelete sets the deleted_at field on the document matched by filter to the
+// current UTC time. The update is audited as an "update" action. It is a
+// convenience wrapper around UpdateOne — no actual MongoDB delete is issued, so
+// the document remains in the collection and can be restored with Restore.
+//
+// Filter can be any valid BSON filter, for example:
+//
+//	col.SoftDelete(ctx, bson.M{"_id": id})
+func (a *AuditableCollection) SoftDelete(ctx context.Context, filter interface{}, opts ...options.Lister[options.UpdateOneOptions]) (*mongo.UpdateResult, error) {
+	return a.UpdateOne(ctx, filter, bson.M{"$set": bson.M{"deleted_at": time.Now().UTC()}}, opts...)
+}
+
+// SoftDeleteMany sets deleted_at on every document matching filter.
+// Each affected document gets its own "update" audit entry (same as UpdateMany).
+func (a *AuditableCollection) SoftDeleteMany(ctx context.Context, filter interface{}, opts ...options.Lister[options.UpdateManyOptions]) (*mongo.UpdateResult, error) {
+	return a.UpdateMany(ctx, filter, bson.M{"$set": bson.M{"deleted_at": time.Now().UTC()}}, opts...)
+}
+
+// Restore clears the deleted_at field on the document matched by filter,
+// making it visible to normal queries again. The update is audited as an
+// "update" action.
+func (a *AuditableCollection) Restore(ctx context.Context, filter interface{}, opts ...options.Lister[options.UpdateOneOptions]) (*mongo.UpdateResult, error) {
+	return a.UpdateOne(ctx, filter, bson.M{"$unset": bson.M{"deleted_at": ""}}, opts...)
+}
+
+// NotDeleted returns a filter that ANDs the given filter with a condition that
+// excludes soft-deleted documents (deleted_at must not exist). Use it to keep
+// soft-delete logic out of call sites:
+//
+//	col.Find(ctx, mongoaudit.NotDeleted(bson.M{"status": "active"}))
+func NotDeleted(filter interface{}) bson.M {
+	base := bson.M{}
+	if f, ok := filter.(bson.M); ok {
+		for k, v := range f {
+			base[k] = v
+		}
+	}
+	base["deleted_at"] = bson.M{"$exists": false}
+	return base
+}
+
 // -------------------------------------------------------------------
 // Read-only pass-throughs
 // -------------------------------------------------------------------
