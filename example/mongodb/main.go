@@ -15,7 +15,6 @@ import (
 	"fmt"
 	"log"
 	"os"
-	"time"
 
 	"go.mongodb.org/mongo-driver/v2/bson"
 	"go.mongodb.org/mongo-driver/v2/mongo"
@@ -23,9 +22,6 @@ import (
 
 	mongoaudit "github.com/vikasavnish/auditable_go/v3/mongodb"
 )
-
-// Ensure time is used (batch soft-delete inline)
-var _ = time.Now
 
 // --------------------------------------------------------------------------
 // Models
