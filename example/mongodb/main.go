@@ -11,7 +11,7 @@ import (
 	"go.mongodb.org/mongo-driver/v2/mongo"
 	"go.mongodb.org/mongo-driver/v2/mongo/options"
 
-	mongoaudit "github.com/vikasavnish/auditable_go/v5/mongodbv2"
+	mongoaudit "github.com/ivikasavnish/auditable_go/v5/mongodbv2"
 )
 
 // --------------------------------------------------------------------------

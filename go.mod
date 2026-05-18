@@ -1,4 +1,4 @@
-module github.com/vikasavnish/auditable_go/v5
+module github.com/ivikasavnish/auditable_go/v5
 
 go 1.25.0
 

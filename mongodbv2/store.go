@@ -4,8 +4,8 @@ import (
 	"context"
 
 	auditablegorm "github.com/ivikasavnish/auditable_go/v5/postgres-gorm"
-	"go.mongodb.org/mongo-driver/bson"
-	"go.mongodb.org/mongo-driver/mongo"
+	"go.mongodb.org/mongo-driver/v2/bson"
+	"go.mongodb.org/mongo-driver/v2/mongo"
 )
 
 // MongoStore implements auditablegorm.AuditStore, persisting GORM audit records

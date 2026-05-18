@@ -24,16 +24,16 @@ The package supports both main integration paths in this repository:
 
 | Package | Use case |
 |---|---|
-| `github.com/vikasavnish/auditable_go/v5/postgres-gorm` | Recommended GORM plugin package. Supports SQL audit storage and custom stores such as MongoDB. |
-| `github.com/vikasavnish/auditable_go/v5/mongodb` | MongoDB collection wrapper and MongoDB-backed GORM audit store. |
-| `github.com/vikasavnish/auditable_go/v5` | Root GORM plugin kept for compatibility with the earlier API. |
+| `github.com/ivikasavnish/auditable_go/v5/postgres-gorm` | Recommended GORM plugin package. Supports SQL audit storage and custom stores such as MongoDB. |
+| `github.com/ivikasavnish/auditable_go/v5/mongodb` | MongoDB collection wrapper and MongoDB-backed GORM audit store. |
+| `github.com/ivikasavnish/auditable_go/v5` | Root GORM plugin kept for compatibility with the earlier API. |
 
 For new code, prefer `postgres-gorm` for GORM integrations because it supports pluggable audit storage.
 
 ## Installation
 
 ```bash
-go get github.com/vikasavnish/auditable_go/v5
+go get github.com/ivikasavnish/auditable_go/v5
 ```
 
 The module currently uses:
@@ -107,7 +107,7 @@ import (
 	"context"
 	"log"
 
-	auditable "github.com/vikasavnish/auditable_go/v5/postgres-gorm"
+	auditable "github.com/ivikasavnish/auditable_go/v5/postgres-gorm"
 	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
 )
@@ -210,7 +210,7 @@ import (
 	"log"
 	"time"
 
-	mongoaudit "github.com/vikasavnish/auditable_go/v5/mongodb"
+	mongoaudit "github.com/ivikasavnish/auditable_go/v5/mongodb"
 	"go.mongodb.org/mongo-driver/v2/bson"
 	"go.mongodb.org/mongo-driver/v2/mongo"
 	"go.mongodb.org/mongo-driver/v2/mongo/options"
@@ -321,8 +321,8 @@ import (
 	"context"
 	"log"
 
-	mongoaudit "github.com/vikasavnish/auditable_go/v5/mongodb"
-	auditable "github.com/vikasavnish/auditable_go/v5/postgres-gorm"
+	mongoaudit "github.com/ivikasavnish/auditable_go/v5/mongodb"
+	auditable "github.com/ivikasavnish/auditable_go/v5/postgres-gorm"
 	"go.mongodb.org/mongo-driver/v2/mongo"
 	"gorm.io/gorm"
 )
