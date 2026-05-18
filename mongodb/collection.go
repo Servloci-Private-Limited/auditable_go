@@ -17,11 +17,12 @@ import (
 	"fmt"
 	"reflect"
 	"strings"
+	"sync"
 	"time"
 
-	"go.mongodb.org/mongo-driver/v2/bson"
-	"go.mongodb.org/mongo-driver/v2/mongo"
-	"go.mongodb.org/mongo-driver/v2/mongo/options"
+	"go.mongodb.org/mongo-driver/bson"
+	"go.mongodb.org/mongo-driver/mongo"
+	"go.mongodb.org/mongo-driver/mongo/options"
 )
 
 // defaultSkipFields are always omitted from every audit entry.
@@ -192,26 +193,38 @@ type structAuditInfo struct {
 	ops      map[string]struct{} // nil = all ops; non-nil = only these op names
 }
 
+// auditInfoCache caches structAuditInfo by reflect.Type so struct tags are
+// parsed only once per type rather than on every write operation.
+var auditInfoCache sync.Map // map[reflect.Type]structAuditInfo
+
 // auditTagsFromStruct reads `auditable` struct tags and returns sets for
 // redacted, skipped, and whitelist-only fields. Mirrors the GORM plugin's
 // includeField / schemaOnlyMode logic.
 func auditTagsFromStruct(v interface{}) structAuditInfo {
-	info := structAuditInfo{
-		redacted: make(map[string]struct{}),
-		skip:     make(map[string]struct{}),
-	}
 	rv := reflect.ValueOf(v)
 	if rv.Kind() == reflect.Ptr {
 		rv = rv.Elem()
 	}
 	if rv.Kind() != reflect.Struct {
-		return info
+		return structAuditInfo{
+			redacted: make(map[string]struct{}),
+			skip:     make(map[string]struct{}),
+		}
+	}
+	t := rv.Type()
+	if cached, ok := auditInfoCache.Load(t); ok {
+		return cached.(structAuditInfo)
+	}
+	info := structAuditInfo{
+		redacted: make(map[string]struct{}),
+		skip:     make(map[string]struct{}),
 	}
 	var hasOnly bool
-	collectStructTags(rv.Type(), &info, &hasOnly)
+	collectStructTags(t, &info, &hasOnly)
 	if !hasOnly {
 		info.only = nil
 	}
+	auditInfoCache.Store(t, info)
 	return info
 }
 
@@ -348,7 +361,7 @@ func (a *AuditableCollection) Collection() *mongo.Collection { return a.coll }
 // -------------------------------------------------------------------
 
 // InsertOne inserts a single document and records a create audit entry.
-func (a *AuditableCollection) InsertOne(ctx context.Context, document interface{}, opts ...options.Lister[options.InsertOneOptions]) (*mongo.InsertOneResult, error) {
+func (a *AuditableCollection) InsertOne(ctx context.Context, document interface{}, opts ...*options.InsertOneOptions) (*mongo.InsertOneResult, error) {
 	setDocumentTimestamps(document)
 	result, err := a.coll.InsertOne(ctx, document, opts...)
 	if err != nil {
@@ -374,7 +387,7 @@ func (a *AuditableCollection) InsertOne(ctx context.Context, document interface{
 
 // InsertMany inserts multiple documents and records one create audit entry per
 // inserted document.
-func (a *AuditableCollection) InsertMany(ctx context.Context, documents []interface{}, opts ...options.Lister[options.InsertManyOptions]) (*mongo.InsertManyResult, error) {
+func (a *AuditableCollection) InsertMany(ctx context.Context, documents []interface{}, opts ...*options.InsertManyOptions) (*mongo.InsertManyResult, error) {
 	for _, doc := range documents {
 		setDocumentTimestamps(doc)
 	}
@@ -408,7 +421,7 @@ func (a *AuditableCollection) InsertMany(ctx context.Context, documents []interf
 // UpdateOne updates the first document matching filter and records an update
 // audit entry. Changes are extracted directly from the update operators
 // (no pre/post read round-trips).
-func (a *AuditableCollection) UpdateOne(ctx context.Context, filter interface{}, update interface{}, opts ...options.Lister[options.UpdateOneOptions]) (*mongo.UpdateResult, error) {
+func (a *AuditableCollection) UpdateOne(ctx context.Context, filter interface{}, update interface{}, opts ...*options.UpdateOptions) (*mongo.UpdateResult, error) {
 	// Resolve the _id of the matched document so the audit entry is tied to a
 	// specific record. A single FindOne (projection: {_id:1}) is cheaper than
 	// a full before-snapshot.
@@ -436,7 +449,7 @@ func (a *AuditableCollection) UpdateOne(ctx context.Context, filter interface{},
 // UpdateMany updates all documents matching filter and records one update audit
 // entry per affected document. Changes are extracted from the update operators
 // directly — no per-document pre/post reads are performed.
-func (a *AuditableCollection) UpdateMany(ctx context.Context, filter interface{}, update interface{}, opts ...options.Lister[options.UpdateManyOptions]) (*mongo.UpdateResult, error) {
+func (a *AuditableCollection) UpdateMany(ctx context.Context, filter interface{}, update interface{}, opts ...*options.UpdateOptions) (*mongo.UpdateResult, error) {
 	// Collect only _ids before the update (minimal projection, no full snapshots).
 	cursor, _ := a.coll.Find(ctx, filter,
 		options.Find().SetProjection(bson.M{"_id": 1}),
@@ -471,7 +484,7 @@ func (a *AuditableCollection) UpdateMany(ctx context.Context, filter interface{}
 
 // ReplaceOne replaces the first document matching filter and records an update
 // audit entry with the full before/after diff.
-func (a *AuditableCollection) ReplaceOne(ctx context.Context, filter interface{}, replacement interface{}, opts ...options.Lister[options.ReplaceOptions]) (*mongo.UpdateResult, error) {
+func (a *AuditableCollection) ReplaceOne(ctx context.Context, filter interface{}, replacement interface{}, opts ...*options.ReplaceOptions) (*mongo.UpdateResult, error) {
 	oldDoc, _ := a.findOne(ctx, filter)
 
 	result, err := a.coll.ReplaceOne(ctx, filter, replacement, opts...)
@@ -497,7 +510,7 @@ func (a *AuditableCollection) ReplaceOne(ctx context.Context, filter interface{}
 
 // DeleteOne deletes the first document matching filter and records a delete
 // audit entry with all field values captured before deletion.
-func (a *AuditableCollection) DeleteOne(ctx context.Context, filter interface{}, opts ...options.Lister[options.DeleteOneOptions]) (*mongo.DeleteResult, error) {
+func (a *AuditableCollection) DeleteOne(ctx context.Context, filter interface{}, opts ...*options.DeleteOptions) (*mongo.DeleteResult, error) {
 	oldDoc, _ := a.findOne(ctx, filter)
 
 	result, err := a.coll.DeleteOne(ctx, filter, opts...)
@@ -518,7 +531,7 @@ func (a *AuditableCollection) DeleteOne(ctx context.Context, filter interface{},
 
 // DeleteMany deletes all documents matching filter and records one delete audit
 // entry per removed document.
-func (a *AuditableCollection) DeleteMany(ctx context.Context, filter interface{}, opts ...options.Lister[options.DeleteManyOptions]) (*mongo.DeleteResult, error) {
+func (a *AuditableCollection) DeleteMany(ctx context.Context, filter interface{}, opts ...*options.DeleteOptions) (*mongo.DeleteResult, error) {
 	oldDocs, _ := a.findMany(ctx, filter)
 
 	result, err := a.coll.DeleteMany(ctx, filter, opts...)
@@ -545,20 +558,20 @@ func (a *AuditableCollection) DeleteMany(ctx context.Context, filter interface{}
 // Filter can be any valid BSON filter, for example:
 //
 //	col.SoftDelete(ctx, bson.M{"_id": id})
-func (a *AuditableCollection) SoftDelete(ctx context.Context, filter interface{}, opts ...options.Lister[options.UpdateOneOptions]) (*mongo.UpdateResult, error) {
+func (a *AuditableCollection) SoftDelete(ctx context.Context, filter interface{}, opts ...*options.UpdateOptions) (*mongo.UpdateResult, error) {
 	return a.UpdateOne(ctx, filter, bson.M{"$set": bson.M{"deleted_at": time.Now().UTC()}}, opts...)
 }
 
 // SoftDeleteMany sets deleted_at on every document matching filter.
 // Each affected document gets its own "update" audit entry (same as UpdateMany).
-func (a *AuditableCollection) SoftDeleteMany(ctx context.Context, filter interface{}, opts ...options.Lister[options.UpdateManyOptions]) (*mongo.UpdateResult, error) {
+func (a *AuditableCollection) SoftDeleteMany(ctx context.Context, filter interface{}, opts ...*options.UpdateOptions) (*mongo.UpdateResult, error) {
 	return a.UpdateMany(ctx, filter, bson.M{"$set": bson.M{"deleted_at": time.Now().UTC()}}, opts...)
 }
 
 // Restore clears the deleted_at field on the document matched by filter,
 // making it visible to normal queries again. The update is audited as an
 // "update" action.
-func (a *AuditableCollection) Restore(ctx context.Context, filter interface{}, opts ...options.Lister[options.UpdateOneOptions]) (*mongo.UpdateResult, error) {
+func (a *AuditableCollection) Restore(ctx context.Context, filter interface{}, opts ...*options.UpdateOptions) (*mongo.UpdateResult, error) {
 	return a.UpdateOne(ctx, filter, bson.M{"$unset": bson.M{"deleted_at": ""}}, opts...)
 }
 
@@ -582,19 +595,19 @@ func NotDeleted(filter interface{}) bson.M {
 // Read-only pass-throughs
 // -------------------------------------------------------------------
 
-func (a *AuditableCollection) FindOne(ctx context.Context, filter interface{}, opts ...options.Lister[options.FindOneOptions]) *mongo.SingleResult {
+func (a *AuditableCollection) FindOne(ctx context.Context, filter interface{}, opts ...*options.FindOneOptions) *mongo.SingleResult {
 	return a.coll.FindOne(ctx, filter, opts...)
 }
 
-func (a *AuditableCollection) Find(ctx context.Context, filter interface{}, opts ...options.Lister[options.FindOptions]) (*mongo.Cursor, error) {
+func (a *AuditableCollection) Find(ctx context.Context, filter interface{}, opts ...*options.FindOptions) (*mongo.Cursor, error) {
 	return a.coll.Find(ctx, filter, opts...)
 }
 
-func (a *AuditableCollection) CountDocuments(ctx context.Context, filter interface{}, opts ...options.Lister[options.CountOptions]) (int64, error) {
+func (a *AuditableCollection) CountDocuments(ctx context.Context, filter interface{}, opts ...*options.CountOptions) (int64, error) {
 	return a.coll.CountDocuments(ctx, filter, opts...)
 }
 
-func (a *AuditableCollection) Aggregate(ctx context.Context, pipeline interface{}, opts ...options.Lister[options.AggregateOptions]) (*mongo.Cursor, error) {
+func (a *AuditableCollection) Aggregate(ctx context.Context, pipeline interface{}, opts ...*options.AggregateOptions) (*mongo.Cursor, error) {
 	return a.coll.Aggregate(ctx, pipeline, opts...)
 }
 

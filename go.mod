@@ -1,4 +1,4 @@
-module github.com/vikasavnish/auditable_go/v3
+module github.com/vikasavnish/auditable_go/v5
 
 go 1.25.0
 
@@ -6,10 +6,16 @@ require (
 	github.com/gin-gonic/gin v1.12.0
 	github.com/go-playground/validator/v10 v10.30.2
 	github.com/joho/godotenv v1.5.1
-	go.mongodb.org/mongo-driver/v2 v2.5.0
+	go.mongodb.org/mongo-driver v1.17.9
+	go.mongodb.org/mongo-driver/v2 v2.6.0
 	gorm.io/datatypes v1.2.5
 	gorm.io/driver/postgres v1.6.0
-	gorm.io/gorm v1.30.0
+	gorm.io/gorm v1.31.1
+)
+
+require (
+	github.com/golang/snappy v0.0.4 // indirect
+	github.com/montanaflynn/stats v0.7.1 // indirect
 )
 
 require (
@@ -56,5 +62,4 @@ require (
 	golang.org/x/text v0.35.0 // indirect
 	google.golang.org/protobuf v1.36.10 // indirect
 	gorm.io/driver/mysql v1.5.6 // indirect
-	gorm.io/driver/sqlite v1.6.0 // indirect
 )

@@ -7,7 +7,7 @@ import (
 	"os"
 
 	"github.com/joho/godotenv"
-	auditable "github.com/vikasavnish/auditable_go/v3/postgres-gorm"
+	auditable "github.com/vikasavnish/auditable_go/v5/postgres-gorm"
 	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
 )

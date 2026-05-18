@@ -10,6 +10,8 @@ import (
 	"gorm.io/gorm"
 )
 
+type oldValuesKey struct{}
+
 // Config controls the audit plugin behaviour.
 type Config struct {
 	// RedactedValue is stored for fields tagged `auditable:"redact"`.
@@ -98,6 +100,7 @@ func (p *plugin) Initialize(db *gorm.DB) error {
 		p.store = NewGormStore(db, p.auditTable)
 	}
 	_ = db.Callback().Create().After("gorm:create").Register("auditablegorm:create", p.afterCreate)
+	_ = db.Callback().Update().Before("gorm:update").Register("auditablegorm:before_update", p.beforeUpdate)
 	_ = db.Callback().Update().After("gorm:update").Register("auditablegorm:update", p.afterUpdate)
 	_ = db.Callback().Delete().After("gorm:delete").Register("auditablegorm:delete", p.afterDelete)
 	return nil
@@ -106,6 +109,38 @@ func (p *plugin) Initialize(db *gorm.DB) error {
 func (p *plugin) afterCreate(db *gorm.DB) { p.audit(db, ActionCreate) }
 func (p *plugin) afterUpdate(db *gorm.DB) { p.audit(db, ActionUpdate) }
 func (p *plugin) afterDelete(db *gorm.DB) { p.audit(db, ActionDelete) }
+
+// beforeUpdate snapshots the current DB state before any update so that
+// auditFromMap and auditFromChangedCols can record [oldValue, newValue].
+func (p *plugin) beforeUpdate(db *gorm.DB) {
+	if p.shouldSkip(db) || db.Statement == nil || db.Statement.Schema == nil {
+		return
+	}
+
+	modelVal := reflect.ValueOf(db.Statement.Model)
+	if modelVal.Kind() == reflect.Ptr {
+		modelVal = modelVal.Elem()
+	}
+	if modelVal.Kind() != reflect.Struct {
+		return
+	}
+
+	pk := pkStr(db, modelVal)
+	if pk == "" {
+		return
+	}
+
+	// Load the current row into a fresh struct of the same type.
+	snapshot := reflect.New(db.Statement.Schema.ModelType).Interface()
+	if err := db.Session(&gorm.Session{NewDB: true}).
+		WithContext(db.Statement.Context).
+		First(snapshot, pk).Error; err != nil {
+		p.handleError(err)
+		return
+	}
+
+	db.Statement.Context = context.WithValue(db.Statement.Context, oldValuesKey{}, snapshot)
+}
 
 // shouldSkip returns true when the statement targets the audit table itself or
 // a caller-specified table that must be excluded.
@@ -280,23 +315,39 @@ func (p *plugin) auditFromMap(db *gorm.DB, userID, comment *string) {
 		return
 	}
 
+	// Retrieve the pre-update snapshot stored by beforeUpdate.
+	var oldVal reflect.Value
+	if snap := db.Statement.Context.Value(oldValuesKey{}); snap != nil {
+		oldVal = reflect.ValueOf(snap)
+		if oldVal.Kind() == reflect.Ptr {
+			oldVal = oldVal.Elem()
+		}
+	}
+
 	destMap := db.Statement.Dest.(map[string]interface{})
 	onlyMode := schemaOnlyMode(db.Statement)
 	changes := make(datatypes.JSONMap, len(destMap))
 	for col, newVal := range destMap {
 		tag := ""
 		dbCol := col
-		if f := schema.LookUpField(col); f != nil {
+		f := schema.LookUpField(col)
+		if f != nil {
 			tag = f.Tag.Get("auditable")
 			dbCol = f.DBName
 		}
 		if !includeField(tag, onlyMode) {
 			continue
 		}
+
+		var prev interface{}
+		if oldVal.IsValid() && f != nil {
+			prev, _ = f.ValueOf(db.Statement.Context, oldVal)
+		}
+
 		if tag == "redact" {
 			changes[dbCol] = []interface{}{p.config.RedactedValue, p.config.RedactedValue}
 		} else {
-			changes[dbCol] = []interface{}{nil, newVal}
+			changes[dbCol] = []interface{}{prev, newVal}
 		}
 	}
 	if len(changes) == 0 {
@@ -316,9 +367,10 @@ func (p *plugin) auditFromMap(db *gorm.DB, userID, comment *string) {
 	})
 }
 
-// auditFromChangedCols handles db.Model(&m).Update("Field", value) and
-// db.Model(&m).Updates(struct) where GORM reports changed columns via
-// db.Statement.Changed.
+// auditFromChangedCols handles db.Model(&m).Update("Field", value),
+// db.Model(&m).Updates(struct), and db.Save(&m). When Model and Dest are the
+// same pointer (Save), Changed() always returns false, so we fall back to
+// comparing field-by-field against the pre-update snapshot.
 func (p *plugin) auditFromChangedCols(db *gorm.DB, userID, comment *string) {
 	schema := db.Statement.Schema
 
@@ -335,21 +387,56 @@ func (p *plugin) auditFromChangedCols(db *gorm.DB, userID, comment *string) {
 		return
 	}
 
+	// Retrieve the pre-update snapshot stored by beforeUpdate.
+	var oldVal reflect.Value
+	if snap := db.Statement.Context.Value(oldValuesKey{}); snap != nil {
+		oldVal = reflect.ValueOf(snap)
+		if oldVal.Kind() == reflect.Ptr {
+			oldVal = oldVal.Elem()
+		}
+	}
+
+	// Resolve the destination value (may be the same pointer as Model for Save).
+	destVal := reflect.ValueOf(db.Statement.Dest)
+	if destVal.Kind() == reflect.Ptr {
+		destVal = destVal.Elem()
+	}
+
 	changes := make(datatypes.JSONMap)
 	onlyMode := schemaOnlyMode(db.Statement)
 	for _, f := range schema.Fields {
-		if !db.Statement.Changed(f.Name) {
+		switch f.Name {
+		case "CreatedAt", "UpdatedAt", "DeletedAt":
 			continue
 		}
 		tag := f.Tag.Get("auditable")
 		if !includeField(tag, onlyMode) {
 			continue
 		}
-		newVal, _ := f.ValueOf(db.Statement.Context, modelVal)
+
+		newFieldVal, _ := f.ValueOf(db.Statement.Context, destVal)
+
+		// Determine whether this field actually changed.
+		// Changed() works for Updates(struct); for Save the Model==Dest so we
+		// compare against the old snapshot instead.
+		changed := db.Statement.Changed(f.Name)
+		if !changed && oldVal.IsValid() {
+			oldFieldVal, _ := f.ValueOf(db.Statement.Context, oldVal)
+			changed = !reflect.DeepEqual(newFieldVal, oldFieldVal)
+		}
+		if !changed {
+			continue
+		}
+
+		var prev interface{}
+		if oldVal.IsValid() {
+			prev, _ = f.ValueOf(db.Statement.Context, oldVal)
+		}
+
 		if tag == "redact" {
 			changes[f.DBName] = []interface{}{p.config.RedactedValue, p.config.RedactedValue}
 		} else {
-			changes[f.DBName] = []interface{}{nil, newVal}
+			changes[f.DBName] = []interface{}{prev, newFieldVal}
 		}
 	}
 	if len(changes) == 0 {

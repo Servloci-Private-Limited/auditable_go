@@ -1,6 +1,7 @@
 package auditable
 
 import (
+	"context"
 	"fmt"
 	"reflect"
 	"time"
@@ -37,6 +38,19 @@ type Config struct {
 	// next version fails. The original data mutation has already completed when
 	// these callbacks run.
 	OnError func(error)
+
+	// UserIDResolver, when set, is called to obtain the current user ID from
+	// the request context. The function should return the user-ID string and
+	// true when a user is present, or ("", false) when no user is available.
+	// When nil the default context key set by WithUserID is used.
+	//
+	//   db.Use(auditable.New(auditable.Config{
+	//       UserIDResolver: func(ctx context.Context) (string, bool) {
+	//           u, ok := ctx.Value(myKey{}).(string)
+	//           return u, ok && u != ""
+	//       },
+	//   }))
+	UserIDResolver func(ctx context.Context) (string, bool)
 }
 
 type plugin struct {
@@ -88,7 +102,13 @@ func (p *plugin) shouldSkip(db *gorm.DB) bool {
 }
 
 func (p *plugin) resolveUserID(db *gorm.DB) *string {
-	s, ok := UserIDFromContext(db.Statement.Context)
+	var s string
+	var ok bool
+	if p.config.UserIDResolver != nil {
+		s, ok = p.config.UserIDResolver(db.Statement.Context)
+	} else {
+		s, ok = UserIDFromContext(db.Statement.Context)
+	}
 	if !ok {
 		return nil
 	}

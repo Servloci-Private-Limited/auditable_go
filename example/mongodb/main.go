@@ -1,17 +1,8 @@
 package main
 
-// MongoDB audit example
-//
-// Start MongoDB first:
-//
-//	docker compose up -d        (from this directory)
-//
-// Then run:
-//
-//	go run .                    (from this directory)
-
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log"
 	"os"
@@ -20,7 +11,7 @@ import (
 	"go.mongodb.org/mongo-driver/v2/mongo"
 	"go.mongodb.org/mongo-driver/v2/mongo/options"
 
-	mongoaudit "github.com/vikasavnish/auditable_go/v3/mongodb"
+	mongoaudit "github.com/vikasavnish/auditable_go/v5/mongodbv2"
 )
 
 // --------------------------------------------------------------------------
@@ -56,8 +47,8 @@ type Voter struct {
 // Campaign — no CRUD gate (all ops audited). auditable:"true" whitelists fields.
 type Campaign struct {
 	mongoaudit.Model `bson:",inline"`
-	Name             string `bson:"name"       auditable:"true"`
-	Status           string `bson:"status"     auditable:"true"`
+	Name             string `bson:"name"        auditable:"true"`
+	Status           string `bson:"status"      auditable:"true"`
 	ProgramID        int    `bson:"program_id"` // not audited — no "true" tag
 }
 
@@ -71,6 +62,7 @@ type Category struct {
 }
 
 // Product — full audit; APIKey is redacted, InternalSKU is never recorded.
+// Demonstrates ReplaceOne: the full before/after diff is captured.
 type Product struct {
 	mongoaudit.Model `bson:",inline"`
 	Name             string  `bson:"name"`
@@ -108,6 +100,10 @@ func main() {
 	if uri == "" {
 		uri = "mongodb://localhost:27025"
 	}
+	dbName := os.Getenv("MONGO_DB")
+	if dbName == "" {
+		dbName = "auditdemo"
+	}
 
 	ctx := context.Background()
 	client, err := mongo.Connect(options.Client().ApplyURI(uri))
@@ -116,11 +112,19 @@ func main() {
 	}
 	defer client.Disconnect(ctx)
 
+	// db is the *mongo.Database supplied by the caller (here via MONGO_DB env var).
+	// Pass any *mongo.Database you already have — NewAuditor does not create its own connection.
+	db := client.Database(dbName)
+
 	// Register the auditor once for the database.
-	// UserIDResolver is the only required config — point it at your context key.
-	auditor := mongoaudit.NewAuditor(client.Database("auditdemo"), "audits", mongoaudit.Config{
+	// OnAudit fires synchronously after every write — use it to forward events
+	// to a log, metrics system, or message bus.
+	auditor := mongoaudit.NewAuditor(db, "audits", mongoaudit.Config{
 		UserIDResolver: func(ctx context.Context) (string, bool) {
 			return mongoaudit.ExtractUserID(ctx, userKey)
+		},
+		OnAudit: func(a *mongoaudit.Audit) {
+			fmt.Printf("  [audit] %-10s %-8s v%d\n", a.AuditableType, a.Action, a.Version)
 		},
 	})
 	if err := auditor.EnsureIndexes(ctx); err != nil {
@@ -133,76 +137,82 @@ func main() {
 	products := auditor.CollectionFor("products", &Product{})
 	tags := auditor.CollectionFor("tags", &Tag{})
 
-	// Every operation below uses a plain context.WithValue context.
-	// The auditor reads the user automatically — no WithUserID calls needed.
-	// Timestamps (CreatedAt / UpdatedAt) are set automatically on insert.
-	ctx = withUser(ctx, "user-1")
+	// ── Voter (user-1) ────────────────────────────────────────────────────
 
-	// ── Voter ─────────────────────────────────────────────────────────────
+	ctx1 := withUser(ctx, "user-1")
 
 	v := &Voter{Name: "Ravi Kumar", EpicNumber: "EPIC001", Age: 42, Status: "active"}
-	res, err := voters.InsertOne(ctx, v) // EpicNumber stored as [REDACTED]
+	res, err := voters.InsertOne(ctx1, v) // EpicNumber stored as [REDACTED]
 	if err != nil {
 		log.Fatal(err)
 	}
 	voterID := res.InsertedID.(bson.ObjectID)
 
-	voters.UpdateOne(ctx,
+	voters.UpdateOne(ctx1,
 		bson.M{"_id": voterID},
 		bson.M{"$set": bson.M{"age": 43}},
 	)
 
-	// delete audited only for create/update (gated by auditable:"create,update")
-	voters.DeleteOne(ctx, bson.M{"_id": voterID})
+	// delete NOT audited — gated by auditable:"create,update" on Voter.Model
+	voters.DeleteOne(ctx1, bson.M{"_id": voterID})
 
-	// ── Campaign ──────────────────────────────────────────────────────────
+	// ── Campaign (user-2) ─────────────────────────────────────────────────
+	// Switching user mid-session: just use a different context.
+
+	ctx2 := withUser(ctx, "user-2")
 
 	c := &Campaign{Name: "Door-to-Door Drive", Status: "draft", ProgramID: 10}
-	res, err = campaigns.InsertOne(ctx, c) // only Name+Status audited; ProgramID skipped
+	res, err = campaigns.InsertOne(ctx2, c) // only Name+Status audited; ProgramID skipped
 	if err != nil {
 		log.Fatal(err)
 	}
 	campaignID := res.InsertedID.(bson.ObjectID)
 
-	campaigns.UpdateOne(ctx,
+	campaigns.UpdateOne(ctx2,
 		bson.M{"_id": campaignID},
 		bson.M{"$set": bson.M{"status": "active"}},
 	)
 
-	// ── Category: soft delete + query + restore ───────────────────────────
+	// Hard-delete campaign — all ops audited for Campaign (no CRUD gate).
+	campaigns.DeleteOne(ctx2, bson.M{"_id": campaignID})
+
+	// ── Category: soft delete + query + restore (user-1) ─────────────────
 	//
-	// MongoDB has no built-in soft-delete; set deleted_at manually.
-	// Normal queries must filter { deleted_at: { $exists: false } }.
-	// The auditor captures the $set as an "update" entry.
+	// MongoDB has no built-in soft-delete; the collection provides
+	// SoftDelete / SoftDeleteMany / Restore helpers that set/unset deleted_at.
+	// Use NotDeleted(filter) to exclude soft-deleted docs in any query.
 
 	cat := &Category{Name: "Technology", Slug: "technology", DisplayOrder: 1}
-	res, err = categories.InsertOne(ctx, cat)
+	res, err = categories.InsertOne(ctx1, cat)
 	if err != nil {
 		log.Fatal(err)
 	}
 	catID := res.InsertedID.(bson.ObjectID)
 
-	categories.UpdateOne(ctx,
+	categories.UpdateOne(ctx1,
 		bson.M{"_id": catID},
 		bson.M{"$set": bson.M{"name": "Tech", "slug": "tech"}},
 	)
 
 	// Soft-delete: sets deleted_at, audited as "update".
-	categories.SoftDelete(ctx, bson.M{"_id": catID})
+	categories.SoftDelete(ctx1, bson.M{"_id": catID})
 
-	// Query — NotDeleted wraps any filter with { deleted_at: { $exists: false } }.
-	visible, _ := categories.CountDocuments(ctx, mongoaudit.NotDeleted(bson.M{}))
+	// NotDeleted wraps any filter with { deleted_at: { $exists: false } }.
+	visible, _ := categories.CountDocuments(ctx1, mongoaudit.NotDeleted(bson.M{}))
 	fmt.Printf("\nVisible categories after soft-delete: %d\n", visible) // 0
 
-	allCats, _ := categories.CountDocuments(ctx, bson.M{})
-	fmt.Printf("All categories (no filter): %d\n", allCats) // 1
+	allCats, _ := categories.CountDocuments(ctx1, bson.M{})
+	fmt.Printf("All categories (including deleted): %d\n", allCats) // 1
 
 	// Restore: unsets deleted_at, audited as "update".
-	categories.Restore(ctx, bson.M{"_id": catID})
-	visible, _ = categories.CountDocuments(ctx, mongoaudit.NotDeleted(bson.M{}))
+	categories.Restore(ctx1, bson.M{"_id": catID})
+	visible, _ = categories.CountDocuments(ctx1, mongoaudit.NotDeleted(bson.M{}))
 	fmt.Printf("Visible categories after restore: %d\n", visible) // 1
 
-	// ── Product: redaction + soft delete ─────────────────────────────────
+	// ── Product: ReplaceOne + redaction + soft delete (user-2) ───────────
+	//
+	// ReplaceOne captures a full before/after diff. APIKey is redacted in both
+	// snapshots; InternalSKU never appears in the audit trail.
 
 	prod := &Product{
 		Name:        "Widget Pro",
@@ -211,24 +221,31 @@ func main() {
 		APIKey:      "sk-live-secret123",
 		InternalSKU: "WDG-001",
 	}
-	res, err = products.InsertOne(ctx, prod) // APIKey → [REDACTED], InternalSKU absent
+	res, err = products.InsertOne(ctx2, prod) // APIKey → [REDACTED], InternalSKU absent
 	if err != nil {
 		log.Fatal(err)
 	}
 	prodID := res.InsertedID.(bson.ObjectID)
 
-	products.UpdateOne(ctx,
+	// ReplaceOne: swaps the whole document; diff shows changed fields only.
+	products.ReplaceOne(ctx2,
 		bson.M{"_id": prodID},
-		bson.M{"$set": bson.M{"price": 39.99, "name": "Widget Pro (Sale)"}},
+		&Product{
+			Name:        "Widget Pro (v2)",
+			Price:       39.99,
+			CategoryID:  catID.Hex(),
+			APIKey:      "sk-live-newkey999", // still stored as [REDACTED]
+			InternalSKU: "WDG-002",           // still never recorded
+		},
 	)
 
-	// Soft-delete; [REDACTED] remains in audit log, InternalSKU never appears.
-	products.SoftDelete(ctx, bson.M{"_id": prodID})
+	// Soft-delete; [REDACTED] stays in log, InternalSKU never appears.
+	products.SoftDelete(ctx2, bson.M{"_id": prodID})
 
-	// ── Tag: batch soft-delete with UpdateMany ────────────────────────────
+	// ── Tag: batch soft-delete with SoftDeleteMany (user-1) ──────────────
 	//
-	// Create several tags for an article, then soft-delete them all at once.
-	// UpdateMany emits one audit entry per affected document.
+	// SoftDeleteMany runs one UpdateMany under the hood; one audit entry is
+	// emitted per affected document.
 
 	articleID := bson.NewObjectID()
 
@@ -237,17 +254,15 @@ func main() {
 		&Tag{Name: "audit", ArticleID: articleID.Hex()},
 		&Tag{Name: "mongodb", ArticleID: articleID.Hex()},
 	}
-	tags.InsertMany(ctx, tagDocs)
+	tags.InsertMany(ctx1, tagDocs)
 
-	// Batch soft-delete all tags for the article.
-	tags.SoftDeleteMany(ctx, bson.M{"article_id": articleID.Hex()})
+	tags.SoftDeleteMany(ctx1, bson.M{"article_id": articleID.Hex()})
 
-	remaining, _ := tags.CountDocuments(ctx, mongoaudit.NotDeleted(bson.M{"article_id": articleID.Hex()}))
+	remaining, _ := tags.CountDocuments(ctx1, mongoaudit.NotDeleted(bson.M{"article_id": articleID.Hex()}))
 	fmt.Printf("\nVisible tags after batch soft-delete: %d\n", remaining) // 0
 
-	// Hard-delete one tag permanently (no soft-delete protection).
-	// Uses DeleteOne which audits the removal.
-	tags.DeleteOne(ctx, bson.M{"article_id": articleID.Hex()})
+	// Hard-delete one tag permanently — audited as "delete".
+	tags.DeleteOne(ctx1, bson.M{"article_id": articleID.Hex()})
 
 	// ── Audit trail ───────────────────────────────────────────────────────
 
@@ -260,13 +275,14 @@ func main() {
 		log.Fatal(err)
 	}
 
-	fmt.Printf("\n%-12s  %-8s  %-5s  %-8s\n", "type", "action", "ver", "user")
-	fmt.Println("────────────  ────────  ─────  ────────")
+	fmt.Printf("\n%-12s  %-8s  %-5s  %-8s  %s\n", "type", "action", "ver", "user", "changes")
+	fmt.Println("────────────  ────────  ─────  ────────  ──────────────────────────────────")
 	for _, r := range trail {
 		uid := "-"
 		if r.UserID != nil {
 			uid = *r.UserID
 		}
-		fmt.Printf("%-12s  %-8s  v%-4d  %s\n", r.AuditableType, r.Action, r.Version, uid)
+		changesJSON, _ := json.Marshal(r.AuditedChanges)
+		fmt.Printf("%-12s  %-8s  v%-4d  %-8s  %s\n", r.AuditableType, r.Action, r.Version, uid, changesJSON)
 	}
 }
