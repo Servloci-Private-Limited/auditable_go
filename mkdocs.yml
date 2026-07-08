@@ -1,0 +1,30 @@
+site_name: auditable_go
+site_description: Application-level audit logging for GORM and MongoDB
+site_url: https://ivikasavnish.github.io/auditable_go/
+repo_url: https://github.com/ivikasavnish/auditable_go
+repo_name: ivikasavnish/auditable_go
+
+docs_dir: docs
+site_dir: site
+exclude_docs: |
+  SUMMARY.md
+
+theme:
+  name: readthedocs
+  highlightjs: true
+
+nav:
+  - Overview: README.md
+  - Project explainer: project-explainer.md
+  - Getting started and migration: initial-migration.md
+  - Custom diffs and large documents: custom-diff-and-large-documents.md
+  - Requirements: auditable.requirements.md
+  - Publishing: publishing.md
+
+markdown_extensions:
+  - tables
+  - fenced_code
+  - toc:
+      permalink: true
+
+strict: true

@@ -25,6 +25,8 @@ type Audit struct {
 	UserID         *string       `bson:"user_id,omitempty"`
 	Action         Action        `bson:"action"`
 	AuditedChanges bson.M        `bson:"audited_changes"`
+	ChangesRef     *string       `bson:"changes_ref,omitempty"`
+	DiffStatus     DiffStatus    `bson:"diff_status,omitempty"`
 	Version        int64         `bson:"version"`
 	Comment        *string       `bson:"comment,omitempty"`
 	CreatedAt      time.Time     `bson:"created_at"`

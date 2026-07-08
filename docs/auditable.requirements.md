@@ -63,6 +63,9 @@ db.Use(auditable.New(auditable.Config{}))
 | `RedactedValue` | `"[REDACTED]"` | Replacement string for redacted fields |
 | `SkipTables` | `[]` | Additional tables that must never be audited |
 | `OnAudit` | `nil` | Optional callback fired after each audit row is persisted |
+| `OnError` | `nil` | Reports audit persistence/version errors |
+| `FailOnAuditError` | `false` | Attaches audit failures to the GORM result |
+| `AllowUnauditedBulk` | `false` | Explicit opt-out for bulk writes without per-row audit identity |
 
 ---
 
@@ -72,9 +75,12 @@ db.Use(auditable.New(auditable.Config{}))
 |---|---|
 | `db.Create(&model)` | Records all non-excluded fields as `[nil, new]` |
 | `db.Create(&slice)` | One audit row per element in the slice |
-| `db.Model(&m).Updates(map)` | Records each map key as `[nil, new]` (old value not available without a pre-load) |
+| `db.Model(&m).Updates(map)` | Preferred plugin preloads the current row and records `[old, new]` |
 | `db.Model(&m).Updates(struct)` | Records fields reported as changed by GORM |
 | `db.Model(&m).Update("Field", val)` | Records the single changed field |
 | `db.Delete(&model)` | Records all fields as `[old, nil]`; works for both soft and hard deletes |
 | `db.Unscoped().Delete(&model)` | Same as above — hard delete is still audited |
 
+Conditional bulk update/delete statements without a concrete primary key are rejected by default. This prevents a successful write from silently lacking per-row audit events.
+
+Per-entity versions are allocated with atomic sequence rows/documents and protected by a unique `(auditable_type, auditable_id, version)` index in preferred stores.

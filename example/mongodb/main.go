@@ -39,7 +39,7 @@ import (
 type Voter struct {
 	mongoaudit.Model `bson:",inline" auditable:"create,update"`
 	Name             string `bson:"name"`
-	EpicNumber       string `bson:"epic_number" auditable:"redact"` // stored as [REDACTED]
+	SSN              string `bson:"ssn"         auditable:"redact"` // stored as [REDACTED]
 	Age              int    `bson:"age"         auditable:"true"`   // whitelist: only audited field
 	Status           string `bson:"status"      auditable:"-"`      // never recorded
 }
@@ -141,8 +141,8 @@ func main() {
 
 	ctx1 := withUser(ctx, "user-1")
 
-	v := &Voter{Name: "Ravi Kumar", EpicNumber: "EPIC001", Age: 42, Status: "active"}
-	res, err := voters.InsertOne(ctx1, v) // EpicNumber stored as [REDACTED]
+	v := &Voter{Name: "Ravi Kumar", SSN: "123-45-6789", Age: 42, Status: "active"}
+	res, err := voters.InsertOne(ctx1, v) // SSN stored as [REDACTED]
 	if err != nil {
 		log.Fatal(err)
 	}

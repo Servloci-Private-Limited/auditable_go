@@ -6,8 +6,8 @@ import (
 	"log"
 	"os"
 
-	"github.com/joho/godotenv"
 	auditable "github.com/ivikasavnish/auditable_go/v5/postgres-gorm"
+	"github.com/joho/godotenv"
 	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
 )
@@ -184,8 +184,9 @@ func main() {
 
 	// ── Tag: batch soft-delete ────────────────────────────────────────────
 	//
-	// Create several tags for the article, then delete them all at once.
-	// Each individual row gets its own audit entry (one per affected ID).
+	// Create several tags, then delete loaded models individually. The plugin
+	// rejects conditional bulk deletes by default because they have no reliable
+	// per-row identity in GORM's callback state.
 
 	article2 := &Article{Title: "Batch Demo", Status: "draft"}
 	d.Create(article2)
@@ -197,8 +198,11 @@ func main() {
 	}
 	d.Create(&tags)
 
-	// Batch soft-delete all tags belonging to article2.
-	d.Where("article_id = ?", article2.ID).Delete(&Tag{})
+	for i := range tags {
+		if err := d.Delete(&tags[i]).Error; err != nil {
+			log.Println("delete tag:", err)
+		}
+	}
 
 	// Confirm: no visible tags remain for that article.
 	var remainingTags []Tag

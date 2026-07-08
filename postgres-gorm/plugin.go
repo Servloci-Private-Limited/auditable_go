@@ -2,6 +2,7 @@ package auditablegorm
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"reflect"
 	"time"
@@ -11,6 +12,8 @@ import (
 )
 
 type oldValuesKey struct{}
+
+var ErrBulkMutationUnsupported = errors.New("auditablegorm: bulk mutation has no concrete primary key; load records and mutate them individually, or set AllowUnauditedBulk")
 
 // Config controls the audit plugin behaviour.
 type Config struct {
@@ -63,6 +66,16 @@ type Config struct {
 	//       Store: mongoaudit.NewMongoStore(auditCol),
 	//   }))
 	Store AuditStore
+
+	// FailOnAuditError attaches audit-store failures to the GORM operation. With
+	// GORM's default transaction this rolls back the business mutation. Custom
+	// cross-database stores still cannot provide atomic commit semantics.
+	FailOnAuditError bool
+
+	// AllowUnauditedBulk permits updates/deletes whose model has no concrete
+	// primary key. It defaults to false because those statements cannot produce
+	// a truthful per-row audit trail with GORM callbacks alone.
+	AllowUnauditedBulk bool
 }
 
 type plugin struct {
@@ -99,10 +112,21 @@ func (p *plugin) Initialize(db *gorm.DB) error {
 	} else {
 		p.store = NewGormStore(db, p.auditTable)
 	}
-	_ = db.Callback().Create().After("gorm:create").Register("auditablegorm:create", p.afterCreate)
-	_ = db.Callback().Update().Before("gorm:update").Register("auditablegorm:before_update", p.beforeUpdate)
-	_ = db.Callback().Update().After("gorm:update").Register("auditablegorm:update", p.afterUpdate)
-	_ = db.Callback().Delete().After("gorm:delete").Register("auditablegorm:delete", p.afterDelete)
+	if err := db.Callback().Create().After("gorm:create").Register("auditablegorm:create", p.afterCreate); err != nil {
+		return err
+	}
+	if err := db.Callback().Update().Before("gorm:update").Register("auditablegorm:before_update", p.beforeUpdate); err != nil {
+		return err
+	}
+	if err := db.Callback().Update().After("gorm:update").Register("auditablegorm:update", p.afterUpdate); err != nil {
+		return err
+	}
+	if err := db.Callback().Delete().Before("gorm:delete").Register("auditablegorm:before_delete", p.beforeDelete); err != nil {
+		return err
+	}
+	if err := db.Callback().Delete().After("gorm:delete").Register("auditablegorm:delete", p.afterDelete); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -127,6 +151,9 @@ func (p *plugin) beforeUpdate(db *gorm.DB) {
 
 	pk := pkStr(db, modelVal)
 	if pk == "" {
+		if !p.config.AllowUnauditedBulk {
+			db.AddError(ErrBulkMutationUnsupported)
+		}
 		return
 	}
 
@@ -136,10 +163,26 @@ func (p *plugin) beforeUpdate(db *gorm.DB) {
 		WithContext(db.Statement.Context).
 		First(snapshot, pk).Error; err != nil {
 		p.handleError(err)
+		if p.config.FailOnAuditError {
+			db.AddError(err)
+		}
 		return
 	}
 
 	db.Statement.Context = context.WithValue(db.Statement.Context, oldValuesKey{}, snapshot)
+}
+
+func (p *plugin) beforeDelete(db *gorm.DB) {
+	if p.shouldSkip(db) || p.config.AllowUnauditedBulk {
+		return
+	}
+	modelVal := reflect.ValueOf(db.Statement.Model)
+	if modelVal.Kind() == reflect.Ptr {
+		modelVal = modelVal.Elem()
+	}
+	if modelVal.Kind() == reflect.Struct && pkStr(db, modelVal) == "" {
+		db.AddError(ErrBulkMutationUnsupported)
+	}
 }
 
 // shouldSkip returns true when the statement targets the audit table itself or
@@ -209,7 +252,7 @@ func (p *plugin) resolveComment(db *gorm.DB) *string {
 // audit is the central dispatch: it routes to the right audit strategy based
 // on the operation type and the shape of db.Statement.Dest.
 func (p *plugin) audit(db *gorm.DB, action Action) {
-	if p.shouldSkip(db) {
+	if p.shouldSkip(db) || db.Error != nil || db.RowsAffected == 0 {
 		return
 	}
 
@@ -258,21 +301,39 @@ func (p *plugin) persist(db *gorm.DB, a *Audit) {
 	}
 	if err := p.store.Save(ctx, r); err != nil {
 		p.handleError(err)
+		if p.config.FailOnAuditError {
+			db.AddError(err)
+		}
 		return
 	}
 	if p.config.OnAudit != nil {
-		p.config.OnAudit(a)
+		if err := invokeAuditCallback(p.config.OnAudit, a); err != nil {
+			p.handleError(err)
+			if p.config.FailOnAuditError {
+				db.AddError(err)
+			}
+		}
 	}
+}
+
+func invokeAuditCallback(callback func(*Audit), audit *Audit) (err error) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			err = fmt.Errorf("auditablegorm: OnAudit panic: %v", recovered)
+		}
+	}()
+	callback(audit)
+	return nil
 }
 
 func (p *plugin) handleError(err error) {
 	if err != nil && p.config.OnError != nil {
-		p.config.OnError(err)
+		func() { defer func() { _ = recover() }(); p.config.OnError(err) }()
 	}
 }
 
 // nextVersion delegates version calculation to the configured store.
-func (p *plugin) nextVersion(db *gorm.DB, auditableType, auditableID string) uint64 {
+func (p *plugin) nextVersion(db *gorm.DB, auditableType, auditableID string) (uint64, bool) {
 	ctx := context.Background()
 	if db.Statement != nil && db.Statement.Context != nil {
 		ctx = db.Statement.Context
@@ -282,9 +343,12 @@ func (p *plugin) nextVersion(db *gorm.DB, auditableType, auditableID string) uin
 	v, err := p.store.NextVersion(ctx, auditableType, auditableID)
 	if err != nil {
 		p.handleError(err)
-		return 1
+		if p.config.FailOnAuditError {
+			db.AddError(err)
+		}
+		return 0, false
 	}
-	return v
+	return v, true
 }
 
 // pkStr returns the string representation of the model's first primary key.
@@ -355,13 +419,17 @@ func (p *plugin) auditFromMap(db *gorm.DB, userID, comment *string) {
 	}
 
 	auditableType := schema.ModelType.Name()
+	version, ok := p.nextVersion(db, auditableType, auditableID)
+	if !ok {
+		return
+	}
 	p.persist(db, &Audit{
 		AuditableID:    auditableID,
 		AuditableType:  auditableType,
 		UserID:         userID,
 		Action:         ActionUpdate,
 		AuditedChanges: changes,
-		Version:        p.nextVersion(db, auditableType, auditableID),
+		Version:        version,
 		Comment:        comment,
 		CreatedAt:      time.Now(),
 	})
@@ -444,13 +512,17 @@ func (p *plugin) auditFromChangedCols(db *gorm.DB, userID, comment *string) {
 	}
 
 	auditableType := schema.ModelType.Name()
+	version, ok := p.nextVersion(db, auditableType, auditableID)
+	if !ok {
+		return
+	}
 	p.persist(db, &Audit{
 		AuditableID:    auditableID,
 		AuditableType:  auditableType,
 		UserID:         userID,
 		Action:         ActionUpdate,
 		AuditedChanges: changes,
-		Version:        p.nextVersion(db, auditableType, auditableID),
+		Version:        version,
 		Comment:        comment,
 		CreatedAt:      time.Now(),
 	})
@@ -505,13 +577,17 @@ func (p *plugin) auditSingle(db *gorm.DB, rv reflect.Value, action Action, userI
 		return
 	}
 
+	version, ok := p.nextVersion(db, auditableType, auditableID)
+	if !ok {
+		return
+	}
 	p.persist(db, &Audit{
 		AuditableID:    auditableID,
 		AuditableType:  auditableType,
 		UserID:         userID,
 		Action:         action,
 		AuditedChanges: changes,
-		Version:        p.nextVersion(db, auditableType, auditableID),
+		Version:        version,
 		Comment:        comment,
 		CreatedAt:      time.Now(),
 	})

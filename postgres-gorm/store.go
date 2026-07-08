@@ -2,10 +2,13 @@ package auditablegorm
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"time"
 
 	"gorm.io/datatypes"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 // gormTxKey is the context key used to propagate the callback *gorm.DB
@@ -45,16 +48,18 @@ type AuditStore interface {
 	// Save persists one audit record. Called synchronously after every mutation.
 	Save(ctx context.Context, r *AuditRecord) error
 
-	// NextVersion returns the next monotonically increasing version number for
-	// the given (auditableType, auditableID) entity pair.
+	// NextVersion atomically allocates the next monotonically increasing version
+	// for the entity. Custom stores must be safe across processes, not only
+	// goroutines in one application instance.
 	NextVersion(ctx context.Context, auditableType, auditableID string) (uint64, error)
 }
 
 // GormStore is the default AuditStore. It writes audit records as rows in the
 // SQL table managed by the GORM *DB passed at plugin initialisation time.
 type GormStore struct {
-	db        *gorm.DB
-	tableName string
+	db           *gorm.DB
+	tableName    string
+	versionTable string
 }
 
 // NewGormStore returns a GormStore backed by db. tableName is the SQL table
@@ -63,7 +68,7 @@ func NewGormStore(db *gorm.DB, tableName string) *GormStore {
 	if tableName == "" {
 		tableName = "audits"
 	}
-	return &GormStore{db: db, tableName: tableName}
+	return &GormStore{db: db, tableName: tableName, versionTable: tableName + "_versions"}
 }
 
 // conn returns a clean *gorm.DB for a store operation.
@@ -91,18 +96,20 @@ func (s *GormStore) Save(ctx context.Context, r *AuditRecord) error {
 	return s.conn(ctx).Table(s.tableName).Create(a).Error
 }
 
-// NextVersion queries the SQL audit table for the current maximum version of
-// the entity and returns max+1.
+// NextVersion atomically increments the entity's sequence row. The sequence
+// table must be migrated with Migrate or MigrateWithTable.
 func (s *GormStore) NextVersion(ctx context.Context, auditableType, auditableID string) (uint64, error) {
-	var v uint64
-	result := s.conn(ctx).
-		Model(&Audit{}).
-		Table(s.tableName).
-		Where("auditable_type = ? AND auditable_id = ?", auditableType, auditableID).
-		Select("COALESCE(MAX(version), 0)").
-		Scan(&v)
+	digest := sha256.Sum256([]byte(auditableType + "\x00" + auditableID))
+	seq := AuditVersion{Key: hex.EncodeToString(digest[:]), Version: 1}
+	result := s.conn(ctx).Table(s.versionTable).Clauses(
+		clause.OnConflict{
+			Columns:   []clause.Column{{Name: "key"}},
+			DoUpdates: clause.Assignments(map[string]interface{}{"version": gorm.Expr("version + 1")}),
+		},
+		clause.Returning{Columns: []clause.Column{{Name: "version"}}},
+	).Create(&seq)
 	if result.Error != nil {
-		return 1, result.Error
+		return 0, result.Error
 	}
-	return v + 1, nil
+	return seq.Version, nil
 }

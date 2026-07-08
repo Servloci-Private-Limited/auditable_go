@@ -12,7 +12,10 @@ if err := db.Use(plugin); err != nil {
 	return err
 }
 
-if err := db.AutoMigrate(&auditable.Audit{}, &User{}); err != nil {
+if err := auditable.Migrate(db); err != nil {
+	return err
+}
+if err := db.AutoMigrate(&User{}); err != nil {
 	return err
 }
 ```
@@ -35,6 +38,17 @@ type Audit struct {
 }
 ```
 
+The preferred GORM store also uses `audit_versions`:
+
+```go
+type AuditVersion struct {
+    Key     string `gorm:"primaryKey;size:64"`
+    Version uint64 `gorm:"not null"`
+}
+```
+
+The key is a SHA-256 digest of entity type and ID. Each event atomically increments this row in the same SQL transaction. Versions are monotonic but may contain gaps after fail-open or cross-store failures.
+
 ## Example SQL
 
 If you manage schema outside GORM, create an equivalent table for your database. A PostgreSQL version looks like this:
@@ -55,14 +69,24 @@ CREATE TABLE audits (
 CREATE INDEX idx_auditable_lookup
   ON audits (auditable_type, auditable_id);
 
+CREATE UNIQUE INDEX uniq_auditable_version
+  ON audits (auditable_type, auditable_id, version);
+
 CREATE INDEX idx_audits_user_id
   ON audits (user_id);
 
 CREATE INDEX idx_audits_action
   ON audits (action);
+
+CREATE TABLE audit_versions (
+  key VARCHAR(64) PRIMARY KEY,
+  version BIGINT NOT NULL
+);
 ```
 
-For MySQL or SQLite, keep the same columns and indexes, and use the database's JSON-capable column type.
+For a custom audit table, use `auditable.MigrateWithTable(db, "custom_audits")`; its sequence table is named `custom_audits_versions`.
+
+The atomic sequence implementation uses `ON CONFLICT ... RETURNING` and is verified for PostgreSQL. Validate dialect behavior before using another GORM database.
 
 ## MongoDB audit collection
 
@@ -76,3 +100,5 @@ if err := auditor.EnsureIndexes(ctx); err != nil {
 ```
 
 When using `mongoaudit.NewMongoStore` with the GORM plugin, call `store.EnsureIndexes(ctx)` on the same audit collection.
+
+MongoDB allocates versions with atomic `$inc` operations in `<audit collection>_versions` by default. MongoDB automatically provides the required unique `_id` index for that collection.

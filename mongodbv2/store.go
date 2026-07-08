@@ -2,10 +2,13 @@ package mongoaudit
 
 import (
 	"context"
+	"crypto/sha256"
+	"fmt"
 
 	auditablegorm "github.com/ivikasavnish/auditable_go/v5/postgres-gorm"
 	"go.mongodb.org/mongo-driver/v2/bson"
 	"go.mongodb.org/mongo-driver/v2/mongo"
+	"go.mongodb.org/mongo-driver/v2/mongo/options"
 )
 
 // MongoStore implements auditablegorm.AuditStore, persisting GORM audit records
@@ -18,12 +21,19 @@ import (
 //	    Store: mongoaudit.NewMongoStore(client.Database("app").Collection("audits")),
 //	}))
 type MongoStore struct {
-	coll *mongo.Collection
+	coll        *mongo.Collection
+	versionColl *mongo.Collection
 }
 
 // NewMongoStore returns a MongoStore that writes to coll.
 func NewMongoStore(coll *mongo.Collection) *MongoStore {
-	return &MongoStore{coll: coll}
+	return &MongoStore{coll: coll, versionColl: coll.Database().Collection(coll.Name() + "_versions")}
+}
+
+// NewMongoStoreWithVersionCollection uses an explicit atomic sequence
+// collection, useful when collection naming is controlled externally.
+func NewMongoStoreWithVersionCollection(coll, versionColl *mongo.Collection) *MongoStore {
+	return &MongoStore{coll: coll, versionColl: versionColl}
 }
 
 // EnsureIndexes creates the recommended indexes on the MongoDB audit
@@ -52,33 +62,12 @@ func (s *MongoStore) Save(ctx context.Context, r *auditablegorm.AuditRecord) err
 // NextVersion returns the next version number for the given entity by querying
 // the audit collection.
 func (s *MongoStore) NextVersion(ctx context.Context, auditableType, auditableID string) (uint64, error) {
-	pipeline := mongo.Pipeline{
-		{{Key: "$match", Value: bson.M{
-			"auditable_type": auditableType,
-			"auditable_id":   auditableID,
-		}}},
-		{{Key: "$group", Value: bson.M{
-			"_id":    nil,
-			"maxVer": bson.M{"$max": "$version"},
-		}}},
-	}
-	cursor, err := s.coll.Aggregate(ctx, pipeline)
-	if err != nil {
-		return 1, err
-	}
-	defer cursor.Close(ctx)
+	key := fmt.Sprintf("%x", sha256.Sum256([]byte(auditableType+"\x00"+auditableID)))
 	var result struct {
-		MaxVer uint64 `bson:"maxVer"`
+		Version uint64 `bson:"version"`
 	}
-	if cursor.Next(ctx) {
-		if err := cursor.Decode(&result); err != nil {
-			return 1, err
-		}
-	}
-	if err := cursor.Err(); err != nil {
-		return 1, err
-	}
-	return result.MaxVer + 1, nil
+	err := s.versionColl.FindOneAndUpdate(ctx, bson.M{"_id": key}, bson.M{"$inc": bson.M{"version": 1}}, options.FindOneAndUpdate().SetUpsert(true).SetReturnDocument(options.After)).Decode(&result)
+	return result.Version, err
 }
 
 // compile-time interface check

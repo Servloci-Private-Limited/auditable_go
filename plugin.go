@@ -81,9 +81,15 @@ func New(cfg Config) gorm.Plugin {
 func (p *plugin) Name() string { return "auditable" }
 
 func (p *plugin) Initialize(db *gorm.DB) error {
-	_ = db.Callback().Create().After("gorm:create").Register("auditable:create", p.afterCreate)
-	_ = db.Callback().Update().After("gorm:update").Register("auditable:update", p.afterUpdate)
-	_ = db.Callback().Delete().After("gorm:delete").Register("auditable:delete", p.afterDelete)
+	if err := db.Callback().Create().After("gorm:create").Register("auditable:create", p.afterCreate); err != nil {
+		return err
+	}
+	if err := db.Callback().Update().After("gorm:update").Register("auditable:update", p.afterUpdate); err != nil {
+		return err
+	}
+	if err := db.Callback().Delete().After("gorm:delete").Register("auditable:delete", p.afterDelete); err != nil {
+		return err
+	}
 	return nil
 }
 

@@ -14,7 +14,7 @@ import (
 //	type Voter struct {
 //	    mongoaudit.Model `bson:",inline"`
 //	    Name        string `bson:"name"`
-//	    EpicNumber  string `bson:"epic_number" auditable:"redact"`
+//	    SSN         string `bson:"ssn" auditable:"redact"`
 //	}
 //
 // CreatedAt / UpdatedAt are set automatically by the auditor on InsertOne and

@@ -14,6 +14,8 @@ package mongoaudit
 
 import (
 	"context"
+	"crypto/sha256"
+	"errors"
 	"fmt"
 	"reflect"
 	"strings"
@@ -69,15 +71,21 @@ type Config struct {
 	//   })
 	//
 	// When nil the auditor falls back to the value stored by WithUserID.
-	UserIDResolver func(ctx context.Context) (string, bool)
+	UserIDResolver        func(ctx context.Context) (string, bool)
+	ChangeComputer        ChangeComputer
+	DeferredChanges       DeferredChangeHandler
+	DiffLimits            DiffLimits
+	FailOnAuditError      bool
+	VersionCollectionName string
 }
 
 // Auditor owns the audit collection and configuration for a MongoDB database.
 // Use it when multiple collections should write to the same audit collection.
 type Auditor struct {
-	db       *mongo.Database
-	auditCol *mongo.Collection
-	config   Config
+	db         *mongo.Database
+	auditCol   *mongo.Collection
+	versionCol *mongo.Collection
+	config     Config
 }
 
 // NewAuditor returns a reusable MongoDB auditor. auditCollectionName defaults
@@ -89,10 +97,15 @@ func NewAuditor(db *mongo.Database, auditCollectionName string, cfg Config) *Aud
 	if auditCollectionName == "" {
 		auditCollectionName = "audits"
 	}
+	versionCollectionName := cfg.VersionCollectionName
+	if versionCollectionName == "" {
+		versionCollectionName = auditCollectionName + "_versions"
+	}
 	return &Auditor{
-		db:       db,
-		auditCol: db.Collection(auditCollectionName),
-		config:   normalizeConfig(cfg),
+		db:         db,
+		auditCol:   db.Collection(auditCollectionName),
+		versionCol: db.Collection(versionCollectionName),
+		config:     normalizeConfig(cfg),
 	}
 }
 
@@ -119,13 +132,14 @@ func (a *Auditor) CollectionFor(name string, example interface{}) *AuditableColl
 	c := a.Wrap(a.db.Collection(name))
 	info := auditTagsFromStruct(example)
 	c.ops = info.ops
+	c.auditInfo = info
 	return c
 }
 
 // Wrap wraps an existing collection with this auditor's audit collection and
 // config. It is useful when the caller already has collection handles.
 func (a *Auditor) Wrap(coll *mongo.Collection) *AuditableCollection {
-	return &AuditableCollection{coll: coll, auditColl: a.auditCol, config: a.config}
+	return &AuditableCollection{coll: coll, auditColl: a.auditCol, versionColl: a.versionCol, config: a.config}
 }
 
 // AuditCollection returns the MongoDB collection where audit documents are
@@ -140,10 +154,12 @@ func (a *Auditor) EnsureIndexes(ctx context.Context) error {
 // AuditableCollection wraps a *mongo.Collection and writes an Audit document
 // to the audit collection after every mutating operation.
 type AuditableCollection struct {
-	coll      *mongo.Collection
-	auditColl *mongo.Collection
-	config    Config
-	ops       map[string]struct{} // nil = all ops; set by CollectionFor
+	coll        *mongo.Collection
+	auditColl   *mongo.Collection
+	config      Config
+	ops         map[string]struct{} // nil = all ops; set by CollectionFor
+	versionColl *mongo.Collection
+	auditInfo   structAuditInfo
 }
 
 // allowsOp reports whether this collection should emit an audit entry for the
@@ -159,7 +175,11 @@ func (a *AuditableCollection) allowsOp(action Action) bool {
 // Wrap returns an AuditableCollection backed by coll. Audit documents are
 // written to auditColl.
 func Wrap(coll, auditColl *mongo.Collection, cfg Config) *AuditableCollection {
-	return &AuditableCollection{coll: coll, auditColl: auditColl, config: normalizeConfig(cfg)}
+	versionName := cfg.VersionCollectionName
+	if versionName == "" {
+		versionName = auditColl.Name() + "_versions"
+	}
+	return &AuditableCollection{coll: coll, auditColl: auditColl, versionColl: auditColl.Database().Collection(versionName), config: normalizeConfig(cfg)}
 }
 
 func normalizeConfig(cfg Config) Config {
@@ -178,6 +198,10 @@ func normalizeConfig(cfg Config) Config {
 		merged[k] = struct{}{}
 	}
 	cfg.SkipFields = merged
+	if cfg.ChangeComputer == nil {
+		cfg.ChangeComputer = defaultChangeComputer{}
+	}
+	cfg.DiffLimits = defaultDiffLimits(cfg.DiffLimits)
 	return cfg
 }
 
@@ -316,6 +340,69 @@ func mergeStringSets(a, b map[string]struct{}) map[string]struct{} {
 	return merged
 }
 
+func (a *AuditableCollection) fieldPolicy(extra structAuditInfo) FieldPolicy {
+	only := a.auditInfo.only
+	if extra.only != nil {
+		only = extra.only
+	}
+	return FieldPolicy{SkipFields: cloneStringSet(mergeStringSets(mergeStringSets(a.config.SkipFields, a.auditInfo.skip), extra.skip)), RedactedFields: cloneStringSet(mergeStringSets(mergeStringSets(a.config.RedactedFields, a.auditInfo.redacted), extra.redacted)), OnlyFields: cloneStringSet(only), RedactedValue: a.config.RedactedValue}
+}
+
+func cloneStringSet(source map[string]struct{}) map[string]struct{} {
+	if source == nil {
+		return nil
+	}
+	clone := make(map[string]struct{}, len(source))
+	for key := range source {
+		clone[key] = struct{}{}
+	}
+	return clone
+}
+
+func (a *AuditableCollection) computeChanges(ctx context.Context, id string, mode ChangeMode, before, after bson.M, update interface{}, extra structAuditInfo) (ChangeResult, error) {
+	req := ChangeRequest{Mode: mode, Before: before, After: after, Update: update, Policy: a.fieldPolicy(extra), Collection: a.coll.Name(), DocumentID: id}
+	limits := a.config.DiffLimits
+	if err := requestComplexity(req, limits); err != nil {
+		return a.deferChanges(ctx, req, err)
+	}
+	computeCtx, cancel := context.WithTimeout(ctx, limits.ComputeTimeout)
+	defer cancel()
+	result, err := a.config.ChangeComputer.Compute(computeCtx, req)
+	if err == nil {
+		err = computeCtx.Err()
+	}
+	if err != nil {
+		return a.deferChanges(ctx, req, err)
+	}
+	if len(result.Changes) > limits.MaxChangedFields {
+		return a.deferChanges(ctx, req, fmt.Errorf("%w: %d changed fields", ErrChangeTooComplex, len(result.Changes)))
+	}
+	if result.Status == "" {
+		result.Status = DiffInline
+	}
+	return result, nil
+}
+
+func (a *AuditableCollection) deferChanges(ctx context.Context, req ChangeRequest, reason error) (ChangeResult, error) {
+	if a.config.DeferredChanges == nil {
+		return ChangeResult{}, reason
+	}
+	var err error
+	req, err = sanitizeDeferredRequest(req)
+	if err != nil {
+		return ChangeResult{}, err
+	}
+	result, err := a.config.DeferredChanges.Defer(ctx, req, reason)
+	if err != nil {
+		return ChangeResult{}, err
+	}
+	if result.Reference == "" {
+		return ChangeResult{}, errors.New("mongoaudit: deferred change handler returned an empty reference")
+	}
+	result.Status = DiffDeferred
+	return result, nil
+}
+
 // parseOpsTag parses a comma-separated CRUD ops value (e.g. "create,update")
 // and populates info.ops. Only "create", "update", and "delete" are recognised;
 // unrecognised tokens are silently ignored so that field-level tags on regular
@@ -340,6 +427,10 @@ func EnsureAuditIndexes(ctx context.Context, auditColl *mongo.Collection) error 
 		{
 			Keys:    bson.D{{Key: "auditable_type", Value: 1}, {Key: "auditable_id", Value: 1}, {Key: "version", Value: -1}},
 			Options: options.Index().SetName("idx_auditable_lookup_version"),
+		},
+		{
+			Keys:    bson.D{{Key: "auditable_type", Value: 1}, {Key: "auditable_id", Value: 1}, {Key: "version", Value: 1}},
+			Options: options.Index().SetName("uniq_auditable_version").SetUnique(true),
 		},
 		{
 			Keys:    bson.D{{Key: "created_at", Value: 1}},
@@ -375,12 +466,14 @@ func (a *AuditableCollection) InsertOne(ctx context.Context, document interface{
 	if merr == nil {
 		id := fmt.Sprint(result.InsertedID)
 		tags := auditTagsFromStruct(document)
-		skip := mergeStringSets(a.config.SkipFields, tags.skip)
-		redacted := mergeStringSets(a.config.RedactedFields, tags.redacted)
-		changes := createChanges(docMap, skip, redacted, a.config.RedactedValue, tags.only)
-		a.persist(ctx, a.buildAudit(ctx, id, ActionCreate, changes))
+		if aerr := a.writeAudit(ctx, id, ActionCreate, ChangeCreate, nil, docMap, nil, tags); aerr != nil && a.config.FailOnAuditError {
+			return result, aerr
+		}
 	} else {
 		a.handleError(merr)
+		if a.config.FailOnAuditError {
+			return result, merr
+		}
 	}
 	return result, nil
 }
@@ -403,6 +496,9 @@ func (a *AuditableCollection) InsertMany(ctx context.Context, documents []interf
 		docMap, merr := toMap(doc)
 		if merr != nil {
 			a.handleError(merr)
+			if a.config.FailOnAuditError {
+				return result, merr
+			}
 			continue
 		}
 		id := ""
@@ -410,10 +506,9 @@ func (a *AuditableCollection) InsertMany(ctx context.Context, documents []interf
 			id = fmt.Sprint(result.InsertedIDs[i])
 		}
 		tags := auditTagsFromStruct(doc)
-		skip := mergeStringSets(a.config.SkipFields, tags.skip)
-		redacted := mergeStringSets(a.config.RedactedFields, tags.redacted)
-		changes := createChanges(docMap, skip, redacted, a.config.RedactedValue, tags.only)
-		a.persist(ctx, a.buildAudit(ctx, id, ActionCreate, changes))
+		if aerr := a.writeAudit(ctx, id, ActionCreate, ChangeCreate, nil, docMap, nil, tags); aerr != nil && a.config.FailOnAuditError {
+			return result, aerr
+		}
 	}
 	return result, nil
 }
@@ -426,9 +521,15 @@ func (a *AuditableCollection) UpdateOne(ctx context.Context, filter interface{},
 	// specific record. A single FindOne (projection: {_id:1}) is cheaper than
 	// a full before-snapshot.
 	var idDoc bson.M
-	_ = a.coll.FindOne(ctx, filter,
+	idErr := a.coll.FindOne(ctx, filter,
 		options.FindOne().SetProjection(bson.M{"_id": 1}),
 	).Decode(&idDoc)
+	if idErr != nil && idErr != mongo.ErrNoDocuments {
+		a.handleError(idErr)
+		if a.config.FailOnAuditError {
+			return nil, idErr
+		}
+	}
 
 	result, err := a.coll.UpdateOne(ctx, filter, update, opts...)
 	if err != nil {
@@ -438,10 +539,9 @@ func (a *AuditableCollection) UpdateOne(ctx context.Context, filter interface{},
 		return result, nil
 	}
 
-	changes := extractUpdateChanges(update, a.config.SkipFields, a.config.RedactedFields, a.config.RedactedValue)
-	if len(changes) > 0 {
-		id := fmt.Sprint(idDoc["_id"])
-		a.persist(ctx, a.buildAudit(ctx, id, ActionUpdate, changes))
+	id := fmt.Sprint(idDoc["_id"])
+	if aerr := a.writeAudit(ctx, id, ActionUpdate, ChangeOperators, nil, nil, update, structAuditInfo{}); aerr != nil && a.config.FailOnAuditError {
+		return result, aerr
 	}
 	return result, nil
 }
@@ -451,13 +551,24 @@ func (a *AuditableCollection) UpdateOne(ctx context.Context, filter interface{},
 // directly — no per-document pre/post reads are performed.
 func (a *AuditableCollection) UpdateMany(ctx context.Context, filter interface{}, update interface{}, opts ...options.Lister[options.UpdateManyOptions]) (*mongo.UpdateResult, error) {
 	// Collect only _ids before the update (minimal projection, no full snapshots).
-	cursor, _ := a.coll.Find(ctx, filter,
+	cursor, findErr := a.coll.Find(ctx, filter,
 		options.Find().SetProjection(bson.M{"_id": 1}),
 	)
+	if findErr != nil {
+		a.handleError(findErr)
+		if a.config.FailOnAuditError {
+			return nil, findErr
+		}
+	}
 	var ids []interface{}
 	if cursor != nil {
 		var idDocs []bson.M
-		_ = cursor.All(ctx, &idDocs)
+		if err := cursor.All(ctx, &idDocs); err != nil {
+			a.handleError(err)
+			if a.config.FailOnAuditError {
+				return nil, err
+			}
+		}
 		cursor.Close(ctx)
 		for _, d := range idDocs {
 			ids = append(ids, d["_id"])
@@ -472,12 +583,10 @@ func (a *AuditableCollection) UpdateMany(ctx context.Context, filter interface{}
 		return result, nil
 	}
 
-	changes := extractUpdateChanges(update, a.config.SkipFields, a.config.RedactedFields, a.config.RedactedValue)
-	if len(changes) == 0 {
-		return result, nil
-	}
 	for _, rawID := range ids {
-		a.persist(ctx, a.buildAudit(ctx, fmt.Sprint(rawID), ActionUpdate, changes))
+		if aerr := a.writeAudit(ctx, fmt.Sprint(rawID), ActionUpdate, ChangeOperators, nil, nil, update, structAuditInfo{}); aerr != nil && a.config.FailOnAuditError {
+			return result, aerr
+		}
 	}
 	return result, nil
 }
@@ -485,7 +594,13 @@ func (a *AuditableCollection) UpdateMany(ctx context.Context, filter interface{}
 // ReplaceOne replaces the first document matching filter and records an update
 // audit entry with the full before/after diff.
 func (a *AuditableCollection) ReplaceOne(ctx context.Context, filter interface{}, replacement interface{}, opts ...options.Lister[options.ReplaceOptions]) (*mongo.UpdateResult, error) {
-	oldDoc, _ := a.findOne(ctx, filter)
+	oldDoc, readErr := a.findOne(ctx, filter)
+	if readErr != nil && readErr != mongo.ErrNoDocuments {
+		a.handleError(readErr)
+		if a.config.FailOnAuditError {
+			return nil, readErr
+		}
+	}
 
 	result, err := a.coll.ReplaceOne(ctx, filter, replacement, opts...)
 	if err != nil {
@@ -500,10 +615,9 @@ func (a *AuditableCollection) ReplaceOne(ctx context.Context, filter interface{}
 		newDoc["_id"] = id
 	}
 
-	changes := diffDocs(oldDoc, newDoc, a.config.SkipFields, a.config.RedactedFields, a.config.RedactedValue)
-	if len(changes) > 0 {
-		id := fmt.Sprint(oldDoc["_id"])
-		a.persist(ctx, a.buildAudit(ctx, id, ActionUpdate, changes))
+	id := fmt.Sprint(oldDoc["_id"])
+	if aerr := a.writeAudit(ctx, id, ActionUpdate, ChangeReplace, oldDoc, newDoc, nil, auditTagsFromStruct(replacement)); aerr != nil && a.config.FailOnAuditError {
+		return result, aerr
 	}
 	return result, nil
 }
@@ -511,7 +625,13 @@ func (a *AuditableCollection) ReplaceOne(ctx context.Context, filter interface{}
 // DeleteOne deletes the first document matching filter and records a delete
 // audit entry with all field values captured before deletion.
 func (a *AuditableCollection) DeleteOne(ctx context.Context, filter interface{}, opts ...options.Lister[options.DeleteOneOptions]) (*mongo.DeleteResult, error) {
-	oldDoc, _ := a.findOne(ctx, filter)
+	oldDoc, readErr := a.findOne(ctx, filter)
+	if readErr != nil && readErr != mongo.ErrNoDocuments {
+		a.handleError(readErr)
+		if a.config.FailOnAuditError {
+			return nil, readErr
+		}
+	}
 
 	result, err := a.coll.DeleteOne(ctx, filter, opts...)
 	if err != nil {
@@ -522,9 +642,10 @@ func (a *AuditableCollection) DeleteOne(ctx context.Context, filter interface{},
 	}
 
 	if len(oldDoc) > 0 {
-		changes := deleteChanges(oldDoc, a.config.SkipFields, a.config.RedactedFields, a.config.RedactedValue)
 		id := fmt.Sprint(oldDoc["_id"])
-		a.persist(ctx, a.buildAudit(ctx, id, ActionDelete, changes))
+		if aerr := a.writeAudit(ctx, id, ActionDelete, ChangeDelete, oldDoc, nil, nil, structAuditInfo{}); aerr != nil && a.config.FailOnAuditError {
+			return result, aerr
+		}
 	}
 	return result, nil
 }
@@ -532,7 +653,13 @@ func (a *AuditableCollection) DeleteOne(ctx context.Context, filter interface{},
 // DeleteMany deletes all documents matching filter and records one delete audit
 // entry per removed document.
 func (a *AuditableCollection) DeleteMany(ctx context.Context, filter interface{}, opts ...options.Lister[options.DeleteManyOptions]) (*mongo.DeleteResult, error) {
-	oldDocs, _ := a.findMany(ctx, filter)
+	oldDocs, readErr := a.findMany(ctx, filter)
+	if readErr != nil {
+		a.handleError(readErr)
+		if a.config.FailOnAuditError {
+			return nil, readErr
+		}
+	}
 
 	result, err := a.coll.DeleteMany(ctx, filter, opts...)
 	if err != nil {
@@ -543,9 +670,10 @@ func (a *AuditableCollection) DeleteMany(ctx context.Context, filter interface{}
 	}
 
 	for _, doc := range oldDocs {
-		changes := deleteChanges(doc, a.config.SkipFields, a.config.RedactedFields, a.config.RedactedValue)
 		id := fmt.Sprint(doc["_id"])
-		a.persist(ctx, a.buildAudit(ctx, id, ActionDelete, changes))
+		if aerr := a.writeAudit(ctx, id, ActionDelete, ChangeDelete, doc, nil, nil, structAuditInfo{}); aerr != nil && a.config.FailOnAuditError {
+			return result, aerr
+		}
 	}
 	return result, nil
 }
@@ -581,14 +709,11 @@ func (a *AuditableCollection) Restore(ctx context.Context, filter interface{}, o
 //
 //	col.Find(ctx, mongoaudit.NotDeleted(bson.M{"status": "active"}))
 func NotDeleted(filter interface{}) bson.M {
-	base := bson.M{}
-	if f, ok := filter.(bson.M); ok {
-		for k, v := range f {
-			base[k] = v
-		}
+	condition := bson.M{"deleted_at": bson.M{"$exists": false}}
+	if filter == nil {
+		return condition
 	}
-	base["deleted_at"] = bson.M{"$exists": false}
-	return base
+	return bson.M{"$and": bson.A{filter, condition}}
 }
 
 // -------------------------------------------------------------------
@@ -615,65 +740,101 @@ func (a *AuditableCollection) Aggregate(ctx context.Context, pipeline interface{
 // Internal helpers
 // -------------------------------------------------------------------
 
-func (a *AuditableCollection) persist(ctx context.Context, audit *Audit) {
-	_, err := a.auditColl.InsertOne(ctx, audit)
+func (a *AuditableCollection) writeAudit(ctx context.Context, id string, action Action, mode ChangeMode, before, after bson.M, update interface{}, extra structAuditInfo) error {
+	result, err := a.computeChanges(ctx, id, mode, before, after, update, extra)
 	if err != nil {
 		a.handleError(err)
-		return
+		return err
+	}
+	if action == ActionUpdate && len(result.Changes) == 0 && result.Reference == "" {
+		return nil
+	}
+	if result.Changes == nil {
+		result.Changes = bson.M{}
+	}
+	audit, err := a.buildAudit(ctx, id, action, result)
+	if err != nil {
+		a.handleError(err)
+		return err
+	}
+	if err := a.persist(ctx, audit); err != nil {
+		a.handleError(err)
+		return err
+	}
+	return nil
+}
+
+func (a *AuditableCollection) persist(ctx context.Context, audit *Audit) error {
+	_, err := a.auditColl.InsertOne(ctx, audit)
+	if err != nil {
+		return err
 	}
 	if a.config.OnAudit != nil {
-		a.config.OnAudit(audit)
+		if err := invokeAuditCallback(a.config.OnAudit, audit); err != nil {
+			return err
+		}
 	}
+	return nil
+}
+
+func invokeAuditCallback(callback func(*Audit), audit *Audit) (err error) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			err = fmt.Errorf("mongoaudit: OnAudit panic: %v", recovered)
+		}
+	}()
+	callback(audit)
+	return nil
 }
 
 func (a *AuditableCollection) handleError(err error) {
 	if err != nil && a.config.OnError != nil {
-		a.config.OnError(err)
+		func() { defer func() { _ = recover() }(); a.config.OnError(err) }()
 	}
 }
 
-func (a *AuditableCollection) buildAudit(ctx context.Context, id string, action Action, changes bson.M) *Audit {
+func (a *AuditableCollection) buildAudit(ctx context.Context, id string, action Action, result ChangeResult) (*Audit, error) {
 	uid := a.resolveUserID(ctx)
 	comment := resolveComment(ctx)
+	version, err := a.nextVersion(ctx, a.coll.Name(), id)
+	if err != nil {
+		return nil, err
+	}
+	var ref *string
+	if result.Reference != "" {
+		ref = &result.Reference
+	}
 	return &Audit{
 		AuditableID:    id,
 		AuditableType:  a.coll.Name(),
 		UserID:         uid,
 		Action:         action,
-		AuditedChanges: changes,
-		Version:        a.nextVersion(ctx, a.coll.Name(), id),
+		AuditedChanges: result.Changes,
+		ChangesRef:     ref,
+		DiffStatus:     result.Status,
+		Version:        version,
 		Comment:        comment,
 		CreatedAt:      time.Now(),
-	}
+	}, nil
 }
 
 // nextVersion returns the current max version for the entity plus one.
-func (a *AuditableCollection) nextVersion(ctx context.Context, auditableType, auditableID string) int64 {
-	pipeline := mongo.Pipeline{
-		{{Key: "$match", Value: bson.M{
-			"auditable_type": auditableType,
-			"auditable_id":   auditableID,
-		}}},
-		{{Key: "$group", Value: bson.M{
-			"_id":    nil,
-			"maxVer": bson.M{"$max": "$version"},
-		}}},
-	}
-	cursor, err := a.auditColl.Aggregate(ctx, pipeline)
-	if err != nil {
-		a.handleError(err)
-		return 1
-	}
-	defer cursor.Close(ctx)
+func (a *AuditableCollection) nextVersion(ctx context.Context, auditableType, auditableID string) (int64, error) {
+	key := fmt.Sprintf("%x", sha256.Sum256([]byte(auditableType+"\x00"+auditableID)))
 	var result struct {
-		MaxVer int64 `bson:"maxVer"`
+		Version int64 `bson:"version"`
 	}
-	if cursor.Next(ctx) {
-		if err := cursor.Decode(&result); err != nil {
-			a.handleError(err)
+	var err error
+	for attempt := 0; attempt < 2; attempt++ {
+		err = a.versionColl.FindOneAndUpdate(ctx, bson.M{"_id": key}, bson.M{"$inc": bson.M{"version": 1}}, options.FindOneAndUpdate().SetUpsert(true).SetReturnDocument(options.After)).Decode(&result)
+		if err == nil {
+			return result.Version, nil
+		}
+		if !mongo.IsDuplicateKeyError(err) {
+			break
 		}
 	}
-	return result.MaxVer + 1
+	return 0, err
 }
 
 func (a *AuditableCollection) findOne(ctx context.Context, filter interface{}) (bson.M, error) {
@@ -734,7 +895,7 @@ func resolveComment(ctx context.Context) *string {
 // diffDocs compares two bson.M snapshots (used for ReplaceOne) and returns a
 // changes map of "fieldName": [oldValue, newValue]. Identical fields and
 // fields in skip are omitted. "_id" is always excluded.
-func diffDocs(old, new bson.M, skip map[string]struct{}, redacted map[string]struct{}, redactedVal string) bson.M {
+func diffDocs(old, new bson.M, skip map[string]struct{}, redacted map[string]struct{}, redactedVal string, only map[string]struct{}) bson.M {
 	changes := bson.M{}
 
 	for k, newVal := range new {
@@ -742,6 +903,9 @@ func diffDocs(old, new bson.M, skip map[string]struct{}, redacted map[string]str
 			continue
 		}
 		if _, s := skip[k]; s {
+			continue
+		}
+		if !includedField(k, only, redacted) {
 			continue
 		}
 		if _, r := redacted[k]; r {
@@ -764,6 +928,9 @@ func diffDocs(old, new bson.M, skip map[string]struct{}, redacted map[string]str
 		if _, s := skip[k]; s {
 			continue
 		}
+		if !includedField(k, only, redacted) {
+			continue
+		}
 		if _, exists := new[k]; !exists {
 			if _, r := redacted[k]; r {
 				changes[k] = bson.A{redactedVal, nil}
@@ -782,12 +949,15 @@ func diffDocs(old, new bson.M, skip map[string]struct{}, redacted map[string]str
 // Supported operators: $set, $unset, $inc, $mul, $push, $addToSet, $pull.
 // For $set the value is stored as-is. For $unset the value is nil.
 // For arithmetic/array operators the value is recorded as {"$op": operand}.
-func extractUpdateChanges(update interface{}, skip map[string]struct{}, redacted map[string]struct{}, redactedVal string) bson.M {
+func extractUpdateChanges(update interface{}, skip map[string]struct{}, redacted map[string]struct{}, redactedVal string, only map[string]struct{}) bson.M {
 	updateMap, _ := toMap(update)
 	changes := bson.M{}
 
 	record := func(field string, value interface{}) {
 		if _, s := skip[field]; s {
+			return
+		}
+		if !includedField(field, only, redacted) {
 			return
 		}
 		if _, r := redacted[field]; r {
@@ -830,10 +1000,8 @@ func createChanges(doc bson.M, skip map[string]struct{}, redacted map[string]str
 		if _, s := skip[k]; s {
 			continue
 		}
-		if only != nil {
-			if _, ok := only[k]; !ok {
-				continue
-			}
+		if !includedField(k, only, redacted) {
+			continue
 		}
 		if _, r := redacted[k]; r {
 			changes[k] = bson.A{nil, redactedVal}
@@ -847,13 +1015,16 @@ func createChanges(doc bson.M, skip map[string]struct{}, redacted map[string]str
 // deleteChanges builds the audited_changes map for a delete.
 // Each field is recorded as [value, nil] so reviewers can see what was removed.
 // Skipped and redacted fields follow the same rules as other operations.
-func deleteChanges(doc bson.M, skip map[string]struct{}, redacted map[string]struct{}, redactedVal string) bson.M {
+func deleteChanges(doc bson.M, skip map[string]struct{}, redacted map[string]struct{}, redactedVal string, only map[string]struct{}) bson.M {
 	changes := make(bson.M, len(doc))
 	for k, v := range doc {
 		if k == "_id" {
 			continue
 		}
 		if _, s := skip[k]; s {
+			continue
+		}
+		if !includedField(k, only, redacted) {
 			continue
 		}
 		if _, r := redacted[k]; r {
@@ -863,6 +1034,17 @@ func deleteChanges(doc bson.M, skip map[string]struct{}, redacted map[string]str
 		}
 	}
 	return changes
+}
+
+func includedField(field string, only, redacted map[string]struct{}) bool {
+	if only == nil {
+		return true
+	}
+	if _, ok := only[field]; ok {
+		return true
+	}
+	_, protected := redacted[field]
+	return protected
 }
 
 // toMap serialises any document value (struct, map, bson.M, etc.) to bson.M

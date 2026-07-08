@@ -2,6 +2,8 @@
 
 `auditable_go` adds Rails-style audit logging to Go applications. It records who changed a record, what action happened, which fields changed, which record was affected, when it happened, and an optional human-readable reason.
 
+Full documentation is available in the GitBook-ready [documentation index](docs/README.md).
+
 The package supports both main integration paths in this repository:
 
 - GORM auditing for SQL-backed models, with audit records stored in SQL by default.
@@ -17,6 +19,8 @@ The package supports both main integration paths in this repository:
 - Supports field/table/collection skipping to reduce audit noise.
 - Supports synchronous `OnAudit` callbacks for logging, streaming, or forwarding audit events.
 - Supports `OnError` callbacks for audit-only failures without changing existing CRUD method signatures.
+- Preferred stores allocate per-entity versions atomically in dedicated SQL tables or MongoDB collections.
+- Supports swappable MongoDB diff algorithms and deferred large-document processing.
 - Provides MongoDB audit indexes through `EnsureIndexes` helpers.
 - Keeps integration small: register a GORM plugin or wrap MongoDB collections once, then use normal create/update/delete calls.
 
@@ -25,7 +29,8 @@ The package supports both main integration paths in this repository:
 | Package | Use case |
 |---|---|
 | `github.com/ivikasavnish/auditable_go/v5/postgres-gorm` | Recommended GORM plugin package. Supports SQL audit storage and custom stores such as MongoDB. |
-| `github.com/ivikasavnish/auditable_go/v5/mongodb` | MongoDB collection wrapper and MongoDB-backed GORM audit store. |
+| `github.com/ivikasavnish/auditable_go/v5/mongodb` | MongoDB driver v1 collection wrapper and GORM audit store. |
+| `github.com/ivikasavnish/auditable_go/v5/mongodbv2` | MongoDB driver v2 collection wrapper and GORM audit store. |
 | `github.com/ivikasavnish/auditable_go/v5` | Root GORM plugin kept for compatibility with the earlier API. |
 
 For new code, prefer `postgres-gorm` for GORM integrations because it supports pluggable audit storage.
@@ -53,6 +58,8 @@ All integrations write the same conceptual audit event.
 | `user_id` | Acting user from context, nullable. |
 | `action` | `create`, `update`, or `delete`. |
 | `audited_changes` | Field-level changes. Usually `field: [oldValue, newValue]`. |
+| `changes_ref` | Optional durable reference for a deferred MongoDB diff. |
+| `diff_status` | MongoDB diff state: `inline` or `deferred`. |
 | `version` | Monotonically increasing version per entity. |
 | `comment` | Optional reason from context, nullable. |
 | `created_at` | Audit timestamp. |
@@ -74,7 +81,7 @@ Example payload:
 }
 ```
 
-For GORM map updates and MongoDB operator updates, old values are not loaded before the update, so the old side is recorded as `nil`. For deletes and MongoDB replacements, the wrapper captures available old values.
+The preferred `postgres-gorm` plugin snapshots loaded-model updates before writing. MongoDB operator updates record requested intent with an unknown (`nil`) old side; replacements and deletes use best-effort snapshots.
 
 ## Context Helpers
 
@@ -139,7 +146,10 @@ func setup() (*gorm.DB, error) {
 		return nil, err
 	}
 
-	if err := db.AutoMigrate(&auditable.Audit{}, &User{}); err != nil {
+	if err := auditable.Migrate(db); err != nil {
+		return nil, err
+	}
+	if err := db.AutoMigrate(&User{}); err != nil {
 		return nil, err
 	}
 
@@ -173,6 +183,8 @@ func run(db *gorm.DB) error {
 | `OnAudit` | `nil` | Called after an audit record is persisted. |
 | `OnError` | `nil` | Called when audit persistence or version lookup fails. |
 | `Store` | SQL store | Custom audit store. Available in `postgres-gorm`. |
+| `FailOnAuditError` | `false` | Attach audit failures to the GORM result; with the default transaction this rolls back the mutation. |
+| `AllowUnauditedBulk` | `false` | Explicitly allow conditional bulk writes that cannot produce reliable per-row events. |
 
 ### GORM Field Tags
 
@@ -196,6 +208,8 @@ Timestamps named `CreatedAt`, `UpdatedAt`, and `DeletedAt` are skipped by the pl
 | `db.Delete(&model)` | Delete audit with fields as `[old, nil]`. |
 | `db.Unscoped().Delete(&model)` | Same audit behavior for hard deletes. |
 
+Conditional bulk updates/deletes whose model has no primary key return `ErrBulkMutationUnsupported` by default. Load records and mutate them individually when each row requires an audit event.
+
 ## MongoDB Integration
 
 Use this when your application writes directly with the MongoDB Go driver.
@@ -210,7 +224,7 @@ import (
 	"log"
 	"time"
 
-	mongoaudit "github.com/ivikasavnish/auditable_go/v5/mongodb"
+	mongoaudit "github.com/ivikasavnish/auditable_go/v5/mongodbv2"
 	"go.mongodb.org/mongo-driver/v2/bson"
 	"go.mongodb.org/mongo-driver/v2/mongo"
 	"go.mongodb.org/mongo-driver/v2/mongo/options"
@@ -225,9 +239,9 @@ func setupMongo(ctx context.Context, uri string) (*mongoaudit.AuditableCollectio
 	db := client.Database("auditdemo")
 	auditor := mongoaudit.NewAuditor(db, "audits", mongoaudit.Config{
 		RedactedFields: map[string]struct{}{
-			"password":    {},
-			"token":       {},
-			"epic_number": {},
+			"password": {},
+			"token":    {},
+			"ssn":      {},
 		},
 		OnAudit: func(a *mongoaudit.Audit) {
 			log.Printf("audit: %s %s/%s v%d", a.Action, a.AuditableType, a.AuditableID, a.Version)
@@ -282,6 +296,11 @@ func runMongo(ctx context.Context, voters *mongoaudit.AuditableCollection) error
 | `SkipFields` | `created_at`, `updated_at` | Top-level fields excluded from every audit entry. Caller values are merged with the defaults. |
 | `OnAudit` | `nil` | Called after an audit document is inserted. |
 | `OnError` | `nil` | Called for audit-only failures such as audit insert or version lookup errors. |
+| `ChangeComputer` | built-in | Swappable BSON/JSON change algorithm implementing `ChangeComputer`. |
+| `DeferredChanges` | `nil` | Handler for oversized/deep payloads; typically uploads snapshots and enqueues delayed computation. |
+| `DiffLimits` | 1 MiB, depth 64, 1,000 fields, 250 ms | Bounds inline change computation. |
+| `FailOnAuditError` | `false` | Return audit/diff errors after the mutation; use a transaction when rollback is required. |
+| `VersionCollectionName` | `<audit collection>_versions` | Atomic per-entity sequence collection. |
 
 ### MongoDB Supported Operations
 
@@ -310,6 +329,8 @@ bson.M{
 
 For `ReplaceOne`, the wrapper compares the old and new document and records true before/after values.
 
+See [Custom diffs and large documents](docs/custom-diff-and-large-documents.md) for pluggable algorithms, object-storage references, complexity limits, timing, and delayed computation.
+
 ## GORM With MongoDB Audit Storage
 
 Use this when business data is stored through GORM, but audit logs should be stored in MongoDB.
@@ -321,7 +342,7 @@ import (
 	"context"
 	"log"
 
-	mongoaudit "github.com/ivikasavnish/auditable_go/v5/mongodb"
+	mongoaudit "github.com/ivikasavnish/auditable_go/v5/mongodbv2"
 	auditable "github.com/ivikasavnish/auditable_go/v5/postgres-gorm"
 	"go.mongodb.org/mongo-driver/v2/mongo"
 	"gorm.io/gorm"
@@ -348,7 +369,7 @@ This integration does not require model changes. Your application keeps using GO
 
 ## Indexes
 
-For SQL audit storage, migrate `auditable.Audit` with GORM or create an equivalent table manually. The key lookup index is:
+For SQL audit storage, call `auditable.Migrate(db)`. It creates the audit table and the atomic `audit_versions` sequence table. The key lookup index is:
 
 ```sql
 CREATE INDEX idx_auditable_lookup
@@ -423,7 +444,10 @@ if err := db.Use(plugin); err != nil {
 	return err
 }
 
-if err := db.AutoMigrate(&auditable.Audit{}, &User{}); err != nil {
+if err := auditable.Migrate(db); err != nil {
+	return err
+}
+if err := db.AutoMigrate(&User{}); err != nil {
 	return err
 }
 ```
@@ -434,7 +458,7 @@ If you manage schema outside GORM, create an `audits` table that matches the `au
 
 - Register the GORM plugin once during database initialization.
 - Wrap MongoDB collections once and pass the wrapped collection through your repository/service layer.
-- Use `OnError` in production so audit-only failures are visible in logs or metrics.
+- Use `OnError` in production and choose `FailOnAuditError` deliberately.
 - Keep `RedactedFields` and `auditable:"redact"` updated as your data model evolves.
 - Avoid auditing high-churn infrastructure fields unless they are meaningful to your compliance story.
 - The current MongoDB wrapper audits top-level fields. Nested values are preserved as values, but nested field-specific redaction is not expanded recursively.
@@ -449,4 +473,4 @@ go test . ./mongodb ./postgres-gorm ./example/mongodb ./example
 go test ./...
 ```
 
-At the time this README was updated, the focused audit package verification passes. The full repository suite may still fail if unrelated model validation tests are out of sync with their enum definitions.
+At the time this README was updated, `go test ./...` and `go vet ./...` pass.
