@@ -473,4 +473,12 @@ go test . ./mongodb ./postgres-gorm ./example/mongodb ./example
 go test ./...
 ```
 
+## License
+
+`auditable_go` is licensed under the [Mozilla Public License 2.0](LICENSE) (MPL-2.0).
+
+You may use this module, unmodified or modified, in open-source or proprietary applications, including as a statically compiled dependency in a closed-source Go binary — MPL-2.0 does not extend its terms to your application's own code. The condition applies only to this library's own files: if you modify a file from this module and distribute that modified file (including as part of a distributed binary), you must publish the modified file's source under MPL-2.0 and make it available to recipients.
+
+Versions of this module published before this license took effect remain available to their recipients under the license in place at the time (MIT for `v5.0.0`); this change applies going forward from the commit that introduced it.
+
 At the time this README was updated, `go test ./...` and `go vet ./...` pass.

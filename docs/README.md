@@ -29,3 +29,7 @@ go vet ./...
 ```
 
 Both commands should pass before documentation is published.
+
+## License
+
+Licensed under the [Mozilla Public License 2.0](https://github.com/ivikasavnish/auditable_go/blob/v5/LICENSE). You may use this module freely, including in proprietary applications; modifications to this library's own files must be published under MPL-2.0 when distributed. Releases before this change (`v5.0.0`) remain available under MIT.
