@@ -1,6 +1,6 @@
 # `auditable_go`: architecture, behavior, review guide, and improvement plan
 
-This document explains why the project exists, how the current implementation works, what it can and cannot guarantee, and what the team should resolve before treating it as a production audit system.
+This document explains why the project exists, what the current implementation can and cannot guarantee, and what the team should resolve before treating it as a production audit system. For a function-by-function, file-referenced walkthrough of the code itself, see [How it works (full anatomy)](how-it-works.md).
 
 It describes the repository state inspected on 2026-07-08. It is intentionally based on the implementation, not only on the claims in the README.
 

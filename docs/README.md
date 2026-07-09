@@ -4,10 +4,11 @@
 
 ## Start here
 
-- [Project explainer and review guide](project-explainer.md) explains the architecture, guarantees, limitations, patterns, and review questions.
+- [How it works (full anatomy)](how-it-works.md) walks the implementation function-by-function, with file references, for developers who want to know exactly what happens on each call.
 - [Initial migration](initial-migration.md) covers the SQL audit and atomic version tables plus MongoDB indexes.
 - [Custom diffs and large documents](custom-diff-and-large-documents.md) covers swappable MongoDB diff engines, complexity controls, object storage, and delayed computation.
 - [Requirements](auditable.requirements.md) defines the audit event contract.
+- [Project explainer and review guide](project-explainer.md) explains guarantees, limitations, patterns, and review questions.
 - [Publishing with GitBook](publishing.md) describes the Git Sync handoff.
 
 ## Package choice
